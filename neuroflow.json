@@ -1,161 +1,2099 @@
 [
-  {"id":"tab-1","type":"tab","label":"🤖 Sensor Simulation","disabled":false,"info":"Main simulation loop - runs every 1.5s. All robot state stored in global context."},
-  {"id":"tab-2","type":"tab","label":"⚙️ Template Automations","disabled":false,"info":"5 pre-built automation templates (Heat Guard, Low Battery, Vib Shield, Predictive Maint, Smart Nav). Use inject nodes to activate/deactivate each."},
-  {"id":"tab-3","type":"tab","label":"🚀 Motion Control","disabled":false,"info":"All robot movement commands: start/stop/e-stop, directional control, dock, patrol, waypoint, path planning."},
-  {"id":"tab-4","type":"tab","label":"🔧 Flow Engine (Demo)","disabled":false,"info":"Visual flow programming equivalent. Four demo chains showing all node types."},
-  {"id":"tab-5","type":"tab","label":"🚨 Alerts & Logging","disabled":false,"info":"Consolidated alerts routed by severity. Full event log."},
-
-  {"id":"t1-cmt-1","type":"comment","z":"tab-1","name":"NeuroFlow HMI — Node-RED Conversion | Tick: 1.5 s | State: global context","info":"All robot and sensor state lives in Node-RED global context.\nAccess anywhere with global.get('key') / global.set('key', value).\n\nKey globals:\n  robot     : {x,y,angle,speed,battery,payload,docked,state}\n  sensors   : {vib, temp}\n  activeTemplates : string[]\n  speedLimit, riskScore, predAlert\n  vibHistory, tempHistory (rolling 120-point arrays)\n  isPatrolling, isDocking, isFollowingPath\n  activePath, activePathIndex, patrolIndex\n  currentZone, lastZone, vibTrend","x":280,"y":40,"wires":[]},
-
-  {"id":"t1-inject-init","type":"inject","z":"tab-1","name":"🚀 Initialize State (runs once)","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":true,"onceDelay":"0.1","topic":"init","payload":"","payloadType":"date","x":190,"y":120,"wires":[["t1-fn-init"]]},
-
-  {"id":"t1-fn-init","type":"function","z":"tab-1","name":"Initialize Global State","func":"global.set('robot', {\n  x:140, y:95, angle:0, speed:100, battery:98,\n  payload:false, docked:false, dockedStation:null, state:'running'\n});\nglobal.set('sensors', {vib:22, temp:36.2});\nglobal.set('activeTemplates', []);\nglobal.set('speedLimit', 100);\nglobal.set('riskScore', 0);\nglobal.set('predAlert', false);\nglobal.set('vibHistory', []);\nglobal.set('tempHistory', []);\nglobal.set('isPatrolling', false);\nglobal.set('isDocking', false);\nglobal.set('isFollowingPath', false);\nglobal.set('activePath', []);\nglobal.set('activePathIndex', 0);\nglobal.set('patrolIndex', 0);\nglobal.set('currentZone', 'A');\nglobal.set('lastZone', 'A');\nglobal.set('vibTrend', 'stable');\nglobal.set('waypointSet', false);\nglobal.set('waypointX', 0);\nglobal.set('waypointY', 0);\nnode.status({fill:'green', shape:'dot', text:'Initialized ✓'});\nmsg.payload = {status:'initialized', timestamp:new Date().toISOString()};\nreturn msg;","outputs":1,"noerr":0,"x":430,"y":120,"wires":[["t1-debug-init"]]},
-
-  {"id":"t1-debug-init","type":"debug","z":"tab-1","name":"✅ Init Complete","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":660,"y":120,"wires":[]},
-
-  {"id":"t1-cmt-2","type":"comment","z":"tab-1","name":"Main Simulation Tick — 1.5 s","info":"Simulates sensor drift, battery drain, robot position drift, docking/charging, patrol and path-following movement. Emits sensor_update on output 1 and motion_event / zone_change on output 2.","x":230,"y":195,"wires":[]},
-
-  {"id":"t1-inject-tick","type":"inject","z":"tab-1","name":"⏱ Tick (1.5 s)","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"1.5","crontab":"","once":true,"onceDelay":"0.5","topic":"tick","payload":"","payloadType":"date","x":160,"y":260,"wires":[["t1-fn-simulate"]]},
-
-  {"id":"t1-fn-simulate","type":"function","z":"tab-1","name":"Simulate Sensors & Robot State","func":"// ── Retrieve state ──\nlet s  = global.get('sensors')  || {vib:22, temp:36.2};\nlet r  = global.get('robot')    || {x:140,y:95,angle:0,speed:100,battery:98,payload:false,docked:false,state:'running'};\nlet sl = global.get('speedLimit') || 100;\nlet vH = global.get('vibHistory')  || [];\nlet tH = global.get('tempHistory') || [];\nlet isPat = global.get('isPatrolling')   || false;\nlet isDk  = global.get('isDocking')      || false;\nlet isPath= global.get('isFollowingPath')|| false;\nlet aPath = global.get('activePath')     || [];\nlet aIdx  = global.get('activePathIndex')|| 0;\nlet pIdx  = global.get('patrolIndex')    || 0;\nconst DOCK_X=50, DOCK_Y=150;\nconst PATROL=[{x:80,y:50},{x:220,y:50},{x:250,y:150},{x:150,y:170},{x:50,y:150},{x:80,y:50}];\n\nconst events = [];\n\n// ── Helper: move robot one step toward target ──\nfunction moveTowards(tx, ty, speed) {\n  const dx=tx-r.x, dy=ty-r.y;\n  const dist=Math.sqrt(dx*dx+dy*dy);\n  if (dist < 4) return true;\n  r.angle = Math.atan2(dy,dx);\n  r.x += dx/dist*Math.min(speed,dist);\n  r.y += dy/dist*Math.min(speed,dist);\n  return false;\n}\n\n// ── Helper: determine zone ──\nconst ZONES=[{id:'A',x1:0,y1:0,x2:160,y2:100},{id:'B',x1:160,y1:0,x2:300,y2:100},{id:'C',x1:0,y1:100,x2:100,y2:200},{id:'D',x1:100,y1:100,x2:300,y2:200}];\nfunction getZone(x,y){for(const z of ZONES)if(x>=z.x1&&x<z.x2&&y>=z.y1&&y<z.y2)return z.id;return 'A';}\n\nif (!r.docked) {\n  // Sensor drift\n  s.vib  = Math.min(100, Math.max(0, s.vib  + (Math.random()-0.5)*5));\n  s.temp = Math.min(80,  Math.max(20, s.temp + (Math.random()-0.5)*1.2));\n  if (r.state==='running') r.battery = Math.max(0, r.battery - Math.random()*0.18);\n  if (Math.random()<0.025)  r.payload = !r.payload;\n\n  if (r.state === 'running') {\n    if (isPath && aPath.length > 0) {\n      if (moveTowards(aPath[aIdx].x, aPath[aIdx].y, (sl/100)*3.5)) {\n        aIdx++;\n        if (aIdx >= aPath.length) {\n          isPath=false; aPath=[]; aIdx=0;\n          events.push({event:'path_complete', msg:'All waypoints reached'});\n        } else {\n          events.push({event:'waypoint_reached', index:aIdx, next:aPath[aIdx]});\n        }\n        global.set('activePath',aPath); global.set('activePathIndex',aIdx); global.set('isFollowingPath',isPath);\n      }\n    } else if (isDk) {\n      if (moveTowards(DOCK_X, DOCK_Y, (sl/100)*3)) {\n        r.docked=true; r.dockedStation='Charging Station'; r.state='idle';\n        isDk=false; global.set('isDocking',false);\n        events.push({event:'docked', station:'Charging Station'});\n      }\n    } else if (global.get('waypointSet')) {\n      const wx=global.get('waypointX'), wy=global.get('waypointY');\n      if (moveTowards(wx, wy, (sl/100)*3.5)) {\n        global.set('waypointSet',false);\n        events.push({event:'waypoint_arrived', zone:getZone(wx,wy)});\n      }\n    } else if (isPat) {\n      if (moveTowards(PATROL[pIdx%PATROL.length].x, PATROL[pIdx%PATROL.length].y, (sl/100)*3)) {\n        pIdx++; global.set('patrolIndex',pIdx);\n        events.push({event:'patrol_waypoint', index:pIdx});\n      }\n    } else {\n      // Free drift\n      r.x = Math.min(295,Math.max(5, r.x+(Math.random()-0.5)*5*(sl/100)));\n      r.y = Math.min(195,Math.max(5, r.y+(Math.random()-0.5)*5*(sl/100)));\n    }\n    r.speed = Math.min(sl, r.speed+1);\n  }\n} else {\n  // Charging at dock\n  r.battery = Math.min(100, r.battery+0.5);\n  s.temp    = Math.max(20,  s.temp-0.2);\n  s.vib     = Math.max(0,   s.vib-1);\n}\n\n// ── Update histories ──\nvH.push(s.vib); tH.push(s.temp);\nif(vH.length>120) vH.shift(); if(tH.length>120) tH.shift();\n\n// ── Risk score ──\nconst risk = Math.min(100, s.vib*0.6 + Math.max(0,s.temp-40)*1.5);\n\n// ── Predictive alert ──\nlet predAlert = global.get('predAlert') || false;\nif(s.vib>65 && !predAlert) predAlert=true;\nelse if(s.vib<48) predAlert=false;\n\n// ── Zone detection ──\nconst zone    = getZone(r.x, r.y);\nconst lastZone= global.get('lastZone') || 'A';\nif(zone !== lastZone) {\n  events.push({event:'zone_change', from:lastZone, to:zone});\n  global.set('lastZone', zone);\n}\n\n// ── Vibration trend ──\nlet trend='stable';\nif(vH.length>=8){const d=vH[vH.length-1]-vH[vH.length-8];if(d>6)trend='rising sharply';else if(d>2)trend='rising';}\n\n// ── Save global state ──\nglobal.set('sensors',s); global.set('robot',r); global.set('riskScore',risk);\nglobal.set('predAlert',predAlert); global.set('vibHistory',vH); global.set('tempHistory',tH);\nglobal.set('currentZone',zone); global.set('vibTrend',trend);\n\nconst sensorMsg = {payload:{sensors:s,robot:r,riskScore:risk,predAlert,currentZone:zone,trend,timestamp:new Date().toISOString()},topic:'sensor_update'};\nconst eventMsg  = events.length ? {payload:events,topic:'motion_events'} : null;\n\nnode.status({fill:risk>70?'red':risk>40?'yellow':'green',shape:'dot',text:`V:${s.vib.toFixed(1)} T:${s.temp.toFixed(1)} R:${risk.toFixed(0)}%`});\nreturn [sensorMsg, eventMsg];","outputs":2,"noerr":0,"x":400,"y":260,"wires":[["t1-link-out-sensor","t1-fn-templates","t1-fn-alerts","t1-debug-sensor"],["t1-debug-events"]]},
-
-  {"id":"t1-link-out-sensor","type":"link out","z":"tab-1","name":"→ Sensor Data (all tabs)","links":["t2-link-in","t5-link-in"],"x":700,"y":240,"wires":[]},
-
-  {"id":"t1-fn-templates","type":"function","z":"tab-1","name":"Apply Active Templates","func":"const s  = global.get('sensors')       || {};\nlet   r  = global.get('robot')          || {};\nconst tpl= global.get('activeTemplates')|| [];\nconst sl = global.get('speedLimit')     || 100;\nconst pred=global.get('predAlert')      || false;\nconst msgs = [];\n\n// 1. Heat Guard\nif(tpl.includes('heat') && s.temp>55 && r.speed>60){\n  r.speed=60;\n  msgs.push({payload:{template:'heat',action:'speed_capped',value:60,reason:`Temp ${s.temp.toFixed(1)}°C > 55°C`},topic:'template_action'});\n}\n// 2. Low Battery Return\nif(tpl.includes('batt') && r.battery<20 && r.state==='running' && !r.docked && !global.get('isDocking')){\n  global.set('isDocking',true);\n  msgs.push({payload:{template:'batt',action:'auto_docking',reason:`Battery ${r.battery.toFixed(0)}% < 20%`},topic:'template_action'});\n}\n// 3. Vibration Shield\nif(tpl.includes('vib') && s.vib>70 && r.speed>50){\n  r.speed=50;\n  msgs.push({payload:{template:'vib',action:'speed_capped',value:50,reason:`Vib ${s.vib.toFixed(1)}% > 70%`},topic:'template_action'});\n}\n// 4. Smart Navigation (stochastic obstacle avoidance)\nif(tpl.includes('nav') && Math.random()<0.05){\n  r.angle=(r.angle||0)+(Math.random()-0.5)*0.3;\n  msgs.push({payload:{template:'nav',action:'rerouting',reason:'Obstacle detected within 1.5 m'},topic:'template_action'});\n}\n// 5. Predictive Maintenance\nif(tpl.includes('maint') && pred && Math.random()<0.1){\n  msgs.push({payload:{template:'maint',action:'maintenance_advisory',reason:'Vibration trend indicates bearing failure risk'},topic:'template_action'});\n}\n\nglobal.set('robot',r);\nif(!msgs.length) return null;\nreturn msgs;","outputs":1,"noerr":0,"x":410,"y":340,"wires":[["t1-debug-template-action"]]},
-
-  {"id":"t1-debug-template-action","type":"debug","z":"tab-1","name":"⚙️ Template Actions","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":670,"y":340,"wires":[]},
-
-  {"id":"t1-fn-alerts","type":"function","z":"tab-1","name":"Generate Alert List","func":"const s    = global.get('sensors')  || {};\nconst r    = global.get('robot')    || {};\nconst risk = global.get('riskScore')|| 0;\nconst pred = global.get('predAlert')|| false;\nconst isDk = global.get('isDocking')|| false;\nconst isPat= global.get('isPatrolling')||false;\nconst isPath=global.get('isFollowingPath')||false;\nconst aPath=global.get('activePath')||[];\nconst aIdx=global.get('activePathIndex')||0;\nconst alerts=[];\n\nif(s.temp>58) alerts.push({level:'danger',type:'temp',   message:`🔥 Critical temp: ${s.temp.toFixed(1)}°C — shutdown risk`});\nelse if(s.temp>45) alerts.push({level:'warn',type:'temp',message:`🌡️ High temp: ${s.temp.toFixed(1)}°C — monitor closely`});\n\nif(s.vib>70) alerts.push({level:'danger',type:'vib',    message:`📳 Critical vibration: ${s.vib.toFixed(1)}% — reduce speed`});\nelse if(s.vib>40) alerts.push({level:'warn',type:'vib', message:`⚡ Elevated vibration: ${s.vib.toFixed(1)}%`});\n\nif(r.battery<20) alerts.push({level:'danger',type:'batt',message:`🔋 Critical battery: ${r.battery.toFixed(0)}% — return to charger`});\nelse if(r.battery<35) alerts.push({level:'warn',type:'batt',message:`🔋 Low battery: ${r.battery.toFixed(0)}%`});\n\nif(pred) alerts.push({level:'warn',type:'predictive',   message:'🔮 Predictive: motor failure risk rising'});\nif(r.state==='error') alerts.push({level:'danger',type:'system',message:'🚨 Robot in error state — manual intervention required'});\nif(r.docked) alerts.push({level:'ok',type:'dock',        message:`⚡ Docked at ${r.dockedStation||'station'} — charging`});\nif(isDk) alerts.push({level:'info',type:'dock',           message:'🔌 Docking — navigating to charging station'});\nif(isPat) alerts.push({level:'info',type:'patrol',        message:'🔁 Patrol route active'});\nif(isPath) alerts.push({level:'info',type:'path',         message:`🗺️ Path following — WP ${aIdx+1}/${aPath.length}`});\n\nnode.status({fill:alerts.some(a=>a.level==='danger')?'red':alerts.length>0?'yellow':'green',shape:'dot',text:`${alerts.length} alerts`});\nmsg.payload=alerts; msg.topic='alerts';\nreturn msg;","outputs":1,"noerr":0,"x":410,"y":410,"wires":[["t1-link-out-alerts","t1-debug-alerts"]]},
-
-  {"id":"t1-link-out-alerts","type":"link out","z":"tab-1","name":"→ Alerts Tab","links":["t5-link-in-alerts"],"x":680,"y":395,"wires":[]},
-  {"id":"t1-debug-alerts","type":"debug","z":"tab-1","name":"🚨 Alerts","active":false,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":660,"y":430,"wires":[]},
-  {"id":"t1-debug-sensor","type":"debug","z":"tab-1","name":"📊 Sensor State (verbose)","active":false,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":700,"y":270,"wires":[]},
-  {"id":"t1-debug-events","type":"debug","z":"tab-1","name":"🗺️ Motion Events","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":680,"y":295,"wires":[]},
-
-  {"id":"t1-cmt-3","type":"comment","z":"tab-1","name":"Fault Injection — manually spike sensors for testing","info":"Use the inject below to artificially drive vibration to 88% to test template and alert firing.","x":280,"y":490,"wires":[]},
-  {"id":"t1-inject-fault","type":"inject","z":"tab-1","name":"⚡ Inject Fault (vib→88%)","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"onceDelay":0.1,"topic":"fault","payload":"{\"vib\":88}","payloadType":"json","x":200,"y":540,"wires":[["t1-fn-fault"]]},
-  {"id":"t1-fn-fault","type":"function","z":"tab-1","name":"Apply Fault Override","func":"let s = global.get('sensors') || {};\nif(msg.payload.vib !== undefined) s.vib = msg.payload.vib;\nif(msg.payload.temp !== undefined) s.temp = msg.payload.temp;\nglobal.set('sensors',s);\nmsg.payload={status:'fault_injected',sensors:s};\nnode.status({fill:'red',shape:'ring',text:`Fault: vib=${s.vib}%`});\nreturn msg;","outputs":1,"noerr":0,"x":430,"y":540,"wires":[["t1-debug-fault"]]},
-  {"id":"t1-debug-fault","type":"debug","z":"tab-1","name":"Fault Applied","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":650,"y":540,"wires":[]},
-
-  {"id":"t1-inject-reset-sensors","type":"inject","z":"tab-1","name":"🔄 Reset Sensors to Normal","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"onceDelay":0.1,"topic":"reset","payload":"{\"vib\":22,\"temp\":36.2}","payloadType":"json","x":200,"y":590,"wires":[["t1-fn-fault"]]},
-
-
-  {"id":"t2-cmt-1","type":"comment","z":"tab-2","name":"Template Automations — activate/deactivate with inject nodes below","info":"Each template monitors the live sensor snapshot forwarded from Tab 1.\n\nTemplates:\n  heat   — Prevent Overheating: speed → 60% when temp > 55°C\n  batt   — Low Battery Return: auto-dock when battery < 20%\n  vib    — Avoid High Vibration: speed → 50% when vib > 70%\n  maint  — Predictive Maintenance: advisory log when failure predicted\n  nav    — Smart Navigation: stochastic obstacle rerouting","x":360,"y":40,"wires":[]},
-
-  {"id":"t2-inject-act-heat","type":"inject","z":"tab-2","name":"🟢 Activate: Heat Guard","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"activate","payload":"heat","payloadType":"str","x":190,"y":120,"wires":[["t2-fn-toggle"]]},
-  {"id":"t2-inject-dea-heat","type":"inject","z":"tab-2","name":"🔴 Deactivate: Heat Guard","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"deactivate","payload":"heat","payloadType":"str","x":190,"y":160,"wires":[["t2-fn-toggle"]]},
-
-  {"id":"t2-inject-act-batt","type":"inject","z":"tab-2","name":"🟢 Activate: Low Battery Return","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"activate","payload":"batt","payloadType":"str","x":190,"y":220,"wires":[["t2-fn-toggle"]]},
-  {"id":"t2-inject-dea-batt","type":"inject","z":"tab-2","name":"🔴 Deactivate: Low Battery Return","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"deactivate","payload":"batt","payloadType":"str","x":190,"y":260,"wires":[["t2-fn-toggle"]]},
-
-  {"id":"t2-inject-act-vib","type":"inject","z":"tab-2","name":"🟢 Activate: Vib Shield","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"activate","payload":"vib","payloadType":"str","x":180,"y":320,"wires":[["t2-fn-toggle"]]},
-  {"id":"t2-inject-dea-vib","type":"inject","z":"tab-2","name":"🔴 Deactivate: Vib Shield","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"deactivate","payload":"vib","payloadType":"str","x":180,"y":360,"wires":[["t2-fn-toggle"]]},
-
-  {"id":"t2-inject-act-maint","type":"inject","z":"tab-2","name":"🟢 Activate: Predictive Maint","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"activate","payload":"maint","payloadType":"str","x":190,"y":420,"wires":[["t2-fn-toggle"]]},
-  {"id":"t2-inject-dea-maint","type":"inject","z":"tab-2","name":"🔴 Deactivate: Predictive Maint","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"deactivate","payload":"maint","payloadType":"str","x":190,"y":460,"wires":[["t2-fn-toggle"]]},
-
-  {"id":"t2-inject-act-nav","type":"inject","z":"tab-2","name":"🟢 Activate: Smart Navigation","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"activate","payload":"nav","payloadType":"str","x":190,"y":520,"wires":[["t2-fn-toggle"]]},
-  {"id":"t2-inject-dea-nav","type":"inject","z":"tab-2","name":"🔴 Deactivate: Smart Navigation","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"deactivate","payload":"nav","payloadType":"str","x":190,"y":560,"wires":[["t2-fn-toggle"]]},
-
-  {"id":"t2-fn-toggle","type":"function","z":"tab-2","name":"Toggle Template State","func":"const id  = msg.payload;\nconst act = msg.topic === 'activate';\nlet tpl   = global.get('activeTemplates') || [];\nconst nameMap = {heat:'Prevent Overheating',batt:'Low Battery Return',vib:'Avoid High Vibration',maint:'Predictive Maintenance',nav:'Smart Navigation'};\n\nif(act && !tpl.includes(id)) tpl.push(id);\nif(!act) tpl = tpl.filter(t => t !== id);\nglobal.set('activeTemplates', tpl);\n\nmsg.payload = {template:id, name:nameMap[id]||id, active:act, activeTemplates:tpl};\nmsg.topic   = 'template_toggle';\nnode.status({fill:act?'green':'grey', shape:'dot', text:`${id}: ${act?'ON':'OFF'} | Active: [${tpl.join(',')}]`});\nreturn msg;","outputs":1,"noerr":0,"x":470,"y":340,"wires":[["t2-debug-toggle"]]},
-
-  {"id":"t2-debug-toggle","type":"debug","z":"tab-2","name":"Template State","active":true,"tosidebar":true,"console":false,"tostatus":true,"complete":"payload","targetType":"msg","x":680,"y":340,"wires":[]},
-
-  {"id":"t2-link-in","type":"link in","z":"tab-2","name":"← Sensor Data","links":["t1-link-out-sensor"],"x":115,"y":660,"wires":[["t2-fn-evaluate"]]},
-
-  {"id":"t2-fn-evaluate","type":"function","z":"tab-2","name":"Evaluate Templates Against Sensor Data","func":"const d   = msg.payload;\nconst tpl = global.get('activeTemplates') || [];\nif(!tpl.length) return null;\n\nconst results = [];\n\n// Heat Guard\nif(tpl.includes('heat')){\n  const firing = d.sensors.temp > 55;\n  results.push({template:'heat',label:'🌡️ Heat Guard',firing,detail:`Temp ${d.sensors.temp.toFixed(1)}°C ${firing?'> 55°C ⚡ TRIGGERED':'≤ 55°C OK'}`});\n}\n// Low Battery Return\nif(tpl.includes('batt')){\n  const firing = d.robot.battery < 20;\n  results.push({template:'batt',label:'🔋 Low Battery Return',firing,detail:`Battery ${d.robot.battery.toFixed(0)}% ${firing?'< 20% ⚡ DOCKING':'≥ 20% OK'}`});\n}\n// Vib Shield\nif(tpl.includes('vib')){\n  const firing = d.sensors.vib > 70;\n  results.push({template:'vib',label:'📳 Vib Shield',firing,detail:`Vib ${d.sensors.vib.toFixed(1)}% ${firing?'> 70% ⚡ SPEED CAP':'≤ 70% OK'}`});\n}\n// Predictive Maintenance\nif(tpl.includes('maint')){\n  const firing = d.predAlert;\n  results.push({template:'maint',label:'🔧 Predictive Maint',firing,detail:`Trend: ${d.trend} ${firing?'⚡ ADVISORY':'– OK'}`});\n}\n// Smart Navigation\nif(tpl.includes('nav')){\n  const firing = Math.random()<0.05; // simulated obstacle detection\n  results.push({template:'nav',label:'🧠 Smart Nav',firing,detail:`Obstacle scan ${firing?'⚡ REROUTING':'– clear'}`});\n}\n\nconst firing = results.filter(r=>r.firing);\nnode.status({fill:firing.length?'red':'green',shape:'dot',text:`${firing.length}/${results.length} templates firing`});\nmsg.payload = {results, firing, timestamp:d.timestamp};\nreturn msg;","outputs":1,"noerr":0,"x":370,"y":660,"wires":[["t2-debug-eval"]]},
-
-  {"id":"t2-debug-eval","type":"debug","z":"tab-2","name":"📊 Template Evaluation","active":true,"tosidebar":true,"console":false,"tostatus":true,"complete":"payload","targetType":"msg","x":650,"y":660,"wires":[]},
-
-
-  {"id":"t3-cmt-1","type":"comment","z":"tab-3","name":"Motion Control — inject a command to change robot state","info":"All commands write to global context 'robot' and motion flags.\nThe simulation tick in Tab 1 reads these flags each cycle to determine movement.","x":310,"y":40,"wires":[]},
-
-  {"id":"t3-cmt-2","type":"comment","z":"tab-3","name":"─── State Commands ───","info":"","x":170,"y":90,"wires":[]},
-  {"id":"t3-inject-start","type":"inject","z":"tab-3","name":"▶ Start Robot","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"cmd","payload":"start","payloadType":"str","x":160,"y":140,"wires":[["t3-fn-state-cmd"]]},
-  {"id":"t3-inject-stop","type":"inject","z":"tab-3","name":"⏹ Stop Robot","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"cmd","payload":"stop","payloadType":"str","x":160,"y":185,"wires":[["t3-fn-state-cmd"]]},
-  {"id":"t3-inject-estop","type":"inject","z":"tab-3","name":"🛑 EMERGENCY STOP","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"cmd","payload":"estop","payloadType":"str","x":160,"y":230,"wires":[["t3-fn-state-cmd"]]},
-  {"id":"t3-inject-manual","type":"inject","z":"tab-3","name":"🕹️ Manual Mode","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"cmd","payload":"manual","payloadType":"str","x":160,"y":275,"wires":[["t3-fn-state-cmd"]]},
-  {"id":"t3-inject-reset","type":"inject","z":"tab-3","name":"🔄 Reset Robot","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"cmd","payload":"reset","payloadType":"str","x":160,"y":320,"wires":[["t3-fn-state-cmd"]]},
-
-  {"id":"t3-fn-state-cmd","type":"function","z":"tab-3","name":"Handle State Command","func":"let r  = global.get('robot')    || {};\nlet sl = global.get('speedLimit') || 100;\nconst cmd = msg.payload;\nswitch(cmd){\n  case 'start':\n    r.state='running'; r.speed=Math.min(sl,100); r.docked=false;\n    global.set('isDocking',false); global.set('isPatrolling',false);\n    node.status({fill:'green',shape:'dot',text:'Running'});\n    break;\n  case 'stop':\n    r.state='idle'; r.speed=0;\n    global.set('isPatrolling',false); global.set('isDocking',false); global.set('isFollowingPath',false);\n    node.status({fill:'grey',shape:'dot',text:'Stopped'});\n    break;\n  case 'estop':\n    r.state='error'; r.speed=0;\n    global.set('isPatrolling',false); global.set('isDocking',false); global.set('isFollowingPath',false);\n    node.status({fill:'red',shape:'ring',text:'EMERGENCY STOP'});\n    break;\n  case 'manual':\n    r.state='running'; r.docked=false;\n    node.status({fill:'blue',shape:'dot',text:'Manual'});\n    break;\n  case 'reset':\n    r.state='running'; r.speed=100; r.x=140; r.y=95; r.angle=0;\n    r.docked=false; r.dockedStation=null; r.payload=false;\n    global.set('speedLimit',100); global.set('isPatrolling',false);\n    global.set('isDocking',false); global.set('isFollowingPath',false);\n    global.set('activePath',[]); global.set('activePathIndex',0);\n    global.set('waypointSet',false);\n    let s=global.get('sensors')||{}; s.vib=22; s.temp=36.2; global.set('sensors',s);\n    node.status({fill:'green',shape:'dot',text:'Reset to defaults'});\n    break;\n}\nglobal.set('robot',r);\nmsg.payload={cmd,robot:r,timestamp:new Date().toISOString()};\nreturn msg;","outputs":1,"noerr":0,"x":450,"y":230,"wires":[["t3-debug-cmd"]]},
-
-  {"id":"t3-cmt-3","type":"comment","z":"tab-3","name":"─── Speed Limit ───","info":"","x":170,"y":390,"wires":[]},
-  {"id":"t3-inject-speed20","type":"inject","z":"tab-3","name":"🐢 Speed Limit → 20%","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"speed","payload":"20","payloadType":"num","x":170,"y":430,"wires":[["t3-fn-speed"]]},
-  {"id":"t3-inject-speed50","type":"inject","z":"tab-3","name":"🚶 Speed Limit → 50%","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"speed","payload":"50","payloadType":"num","x":170,"y":470,"wires":[["t3-fn-speed"]]},
-  {"id":"t3-inject-speed100","type":"inject","z":"tab-3","name":"⚡ Speed Limit → 100%","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"speed","payload":"100","payloadType":"num","x":170,"y":510,"wires":[["t3-fn-speed"]]},
-  {"id":"t3-fn-speed","type":"function","z":"tab-3","name":"Set Speed Limit","func":"const v = parseInt(msg.payload);\nglobal.set('speedLimit', v);\nlet r = global.get('robot') || {};\nr.speed = Math.min(r.speed, v);\nglobal.set('robot',r);\nnode.status({fill:'blue',shape:'dot',text:`Limit: ${v}%`});\nmsg.payload={speedLimit:v,robotSpeed:r.speed};\nreturn msg;","outputs":1,"noerr":0,"x":440,"y":470,"wires":[["t3-debug-cmd"]]},
-
-  {"id":"t3-cmt-4","type":"comment","z":"tab-3","name":"─── Navigation Commands ───","info":"","x":190,"y":580,"wires":[]},
-  {"id":"t3-inject-dock","type":"inject","z":"tab-3","name":"🔌 Return to Dock","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"nav","payload":"dock","payloadType":"str","x":160,"y":630,"wires":[["t3-fn-nav-cmd"]]},
-  {"id":"t3-inject-patrol","type":"inject","z":"tab-3","name":"🔁 Toggle Patrol","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"nav","payload":"patrol","payloadType":"str","x":160,"y":675,"wires":[["t3-fn-nav-cmd"]]},
-  {"id":"t3-inject-spin","type":"inject","z":"tab-3","name":"🌀 360° Scan","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"nav","payload":"spin","payloadType":"str","x":155,"y":720,"wires":[["t3-fn-nav-cmd"]]},
-  {"id":"t3-inject-waypoint","type":"inject","z":"tab-3","name":"📍 Set Random Waypoint","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"nav","payload":"waypoint","payloadType":"str","x":180,"y":765,"wires":[["t3-fn-nav-cmd"]]},
-
-  {"id":"t3-fn-nav-cmd","type":"function","z":"tab-3","name":"Handle Navigation Command","func":"const cmd = msg.payload;\nlet r = global.get('robot') || {};\nif(r.state==='error') { node.warn('Cannot nav — robot in error state'); return null; }\nswitch(cmd){\n  case 'dock':\n    r.state='running'; r.docked=false;\n    global.set('isDocking',true); global.set('isPatrolling',false); global.set('isFollowingPath',false);\n    node.status({fill:'blue',shape:'dot',text:'Docking…'});\n    break;\n  case 'patrol':\n    const was = global.get('isPatrolling') || false;\n    global.set('isPatrolling',!was); global.set('isDocking',false); global.set('patrolIndex',0);\n    node.status({fill:!was?'green':'grey',shape:'dot',text:!was?'Patrolling':'Patrol OFF'});\n    break;\n  case 'spin':\n    r.angle = (r.angle||0) + Math.PI*2; // will smoothly animate in tick\n    node.status({fill:'yellow',shape:'dot',text:'Spinning…'});\n    break;\n  case 'waypoint':\n    const wx=Math.random()*260+20, wy=Math.random()*160+20;\n    global.set('waypointSet',true); global.set('waypointX',wx); global.set('waypointY',wy);\n    global.set('isPatrolling',false); global.set('isDocking',false); global.set('isFollowingPath',false);\n    node.status({fill:'green',shape:'dot',text:`WP→(${wx.toFixed(0)},${wy.toFixed(0)})`});\n    msg.waypointCoords = {x:wx, y:wy};\n    break;\n}\nglobal.set('robot',r);\nmsg.payload={cmd,robot:r,isPatrolling:global.get('isPatrolling'),isDocking:global.get('isDocking')};\nreturn msg;","outputs":1,"noerr":0,"x":460,"y":700,"wires":[["t3-debug-cmd"]]},
-
-  {"id":"t3-cmt-5","type":"comment","z":"tab-3","name":"─── Path Planning ───","info":"Send a waypoints array [{x,y},…] as the payload to start multi-point path following.","x":185,"y":835,"wires":[]},
-  {"id":"t3-inject-path","type":"inject","z":"tab-3","name":"🗺️ Path Plan (demo route)","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"path","payload":"[{\"x\":80,\"y\":50},{\"x\":220,\"y\":50},{\"x\":250,\"y\":150},{\"x\":150,\"y\":170}]","payloadType":"json","x":185,"y":880,"wires":[["t3-fn-path"]]},
-  {"id":"t3-fn-path","type":"function","z":"tab-3","name":"Execute Path Plan","func":"let wps = msg.payload;\nif(!Array.isArray(wps)||!wps.length){ node.warn('No valid waypoints'); return null; }\nconst ZONES=[{id:'A',x1:0,y1:0,x2:160,y2:100},{id:'B',x1:160,y1:0,x2:300,y2:100},{id:'C',x1:0,y1:100,x2:100,y2:200},{id:'D',x1:100,y1:100,x2:300,y2:200}];\nfunction gz(x,y){for(const z of ZONES)if(x>=z.x1&&x<z.x2&&y>=z.y1&&y<z.y2)return z.id;return'A';}\n\nglobal.set('activePath',wps); global.set('activePathIndex',0); global.set('isFollowingPath',true);\nglobal.set('isDocking',false); global.set('isPatrolling',false);\nlet r=global.get('robot')||{}; r.docked=false; r.state='running'; global.set('robot',r);\n\nconst route=wps.map((w,i)=>`WP${i+1}:(${w.x},${w.y}) Zone ${gz(w.x,w.y)}`).join(' → ');\nnode.status({fill:'blue',shape:'dot',text:`Path: ${wps.length} WPs`});\nmsg.payload={status:'path_started',waypoints:wps,route,count:wps.length};\nreturn msg;","outputs":1,"noerr":0,"x":450,"y":880,"wires":[["t3-debug-cmd"]]},
-
-  {"id":"t3-debug-cmd","type":"debug","z":"tab-3","name":"🚀 Motion Output","active":true,"tosidebar":true,"console":false,"tostatus":true,"complete":"payload","targetType":"msg","x":700,"y":550,"wires":[]},
-
-
-  {"id":"t4-cmt-1","type":"comment","z":"tab-4","name":"Flow Engine — Equivalent of the drag-drop visual flow builder","info":"Four independent demo chains, each mapping to a section of the original Flow Engine.\n\nChain A: Vibration Sensor → Condition → Reduce Speed + Alert\nChain B: Move To → Pick Payload → Path Planning → Drop Payload\nChain C: Dock → Loop (2×) → Wait 3s\nChain D: Zone Detector → Emergency Stop → Auto-Reset","x":380,"y":40,"wires":[]},
-
-  {"id":"t4-cmt-a","type":"comment","z":"tab-4","name":"Chain A — Vibration Sensor → Condition (IF vib > 40) → Reduce Speed + Alert","info":"","x":360,"y":100,"wires":[]},
-  {"id":"t4-inject-a","type":"inject","z":"tab-4","name":"▶ Run Chain A","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"flow","payload":"","payloadType":"date","x":160,"y":150,"wires":[["t4-fn-vib-sensor"]]},
-  {"id":"t4-fn-vib-sensor","type":"function","z":"tab-4","name":"📡 Vibration Sensor","func":"const s = global.get('sensors') || {vib:22};\nmsg.payload = {sensorType:'vibration', value:s.vib, threshold:40};\nmsg.topic = 'sensor_read';\nnode.status({fill:'green',shape:'dot',text:`vib=${s.vib.toFixed(1)}%`});\nreturn msg;","outputs":1,"noerr":0,"x":360,"y":150,"wires":[["t4-sw-condition"]]},
-  {"id":"t4-sw-condition","type":"switch","z":"tab-4","name":"⚖️ Condition: vib > threshold","property":"payload.value","propertyType":"msg","rules":[{"t":"gt","v":"payload.threshold","vt":"msg"},{"t":"else"}],"checkall":"true","repair":false,"outputs":2,"x":600,"y":150,"wires":[["t4-fn-reduce-speed","t4-fn-send-alert"],["t4-fn-no-action"]]},
-  {"id":"t4-fn-reduce-speed","type":"function","z":"tab-4","name":"🐢 Reduce Speed","func":"let r=global.get('robot')||{};\nconst was=r.speed;\nr.speed=Math.max(20,r.speed-30);\nglobal.set('robot',r);\nmsg.payload={action:'reduce_speed',from:was,to:r.speed,reason:`vib ${msg.payload.value.toFixed(1)}% > ${msg.payload.threshold}%`};\nnode.status({fill:'yellow',shape:'dot',text:`Speed: ${was}% → ${r.speed}%`});\nreturn msg;","outputs":1,"noerr":0,"x":840,"y":120,"wires":[["t4-debug-a"]]},
-  {"id":"t4-fn-send-alert","type":"function","z":"tab-4","name":"🚨 Send Alert","func":"msg.payload={action:'send_alert',severity:'warning',message:`High vibration: ${msg.payload.value.toFixed(1)}% exceeds threshold ${msg.payload.threshold}%`,timestamp:new Date().toISOString()};\nnode.status({fill:'red',shape:'ring',text:'Alert sent'});\nreturn msg;","outputs":1,"noerr":0,"x":840,"y":165,"wires":[["t4-debug-a"]]},
-  {"id":"t4-fn-no-action","type":"function","z":"tab-4","name":"✅ No Action (normal)","func":"msg.payload={action:'no_action',status:'nominal',value:msg.payload.value};\nnode.status({fill:'green',shape:'dot',text:'All clear'});\nreturn msg;","outputs":1,"noerr":0,"x":840,"y":210,"wires":[["t4-debug-a"]]},
-  {"id":"t4-debug-a","type":"debug","z":"tab-4","name":"Chain A Output","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":1070,"y":165,"wires":[]},
-
-  {"id":"t4-cmt-b","type":"comment","z":"tab-4","name":"Chain B — Move To → Pick Payload → Path Planning → Drop Payload","info":"","x":340,"y":290,"wires":[]},
-  {"id":"t4-inject-b","type":"inject","z":"tab-4","name":"▶ Run Chain B","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"flow","payload":"","payloadType":"date","x":160,"y":340,"wires":[["t4-fn-move-to"]]},
-  {"id":"t4-fn-move-to","type":"function","z":"tab-4","name":"🚀 Move To (220,50)","func":"let r=global.get('robot')||{};\nconst target={x:220,y:50,speed:80};\nglobal.set('isDocking',false); global.set('isPatrolling',false); global.set('isFollowingPath',false);\nglobal.set('waypointSet',true); global.set('waypointX',target.x); global.set('waypointY',target.y);\nr.state='running'; r.docked=false; global.set('robot',r);\nmsg.payload={action:'move_to',target,status:'navigating'};\nnode.status({fill:'blue',shape:'dot',text:`→ (${target.x},${target.y})`});\nreturn msg;","outputs":1,"noerr":0,"x":360,"y":340,"wires":[["t4-delay-travel"]]},
-  {"id":"t4-delay-travel","type":"delay","z":"tab-4","name":"Travel Time (2s)","pauseType":"delay","timeout":"2","timeoutUnits":"seconds","rate":"1","nbRateUnits":"1","rateUnits":"second","randomFirst":"1","randomLast":"5","randomUnits":"seconds","drop":false,"allowrate":false,"x":560,"y":340,"wires":[["t4-fn-pick"]]},
-  {"id":"t4-fn-pick","type":"function","z":"tab-4","name":"📦 Pick Payload","func":"let r=global.get('robot')||{};\nr.payload=true; global.set('robot',r);\nglobal.set('waypointSet',false);\nmsg.payload={action:'pick_payload',type:'Pallet',status:'picked',carrying:true};\nnode.status({fill:'green',shape:'dot',text:'Payload picked ✓'});\nreturn msg;","outputs":1,"noerr":0,"x":740,"y":340,"wires":[["t4-delay-pickup"]]},
-  {"id":"t4-delay-pickup","type":"delay","z":"tab-4","name":"Pickup Time (2s)","pauseType":"delay","timeout":"2","timeoutUnits":"seconds","rate":"1","nbRateUnits":"1","rateUnits":"second","randomFirst":"1","randomLast":"5","randomUnits":"seconds","drop":false,"allowrate":false,"x":910,"y":340,"wires":[["t4-fn-path-plan"]]},
-  {"id":"t4-fn-path-plan","type":"function","z":"tab-4","name":"🗺️ Path Planning","func":"const wps=[{x:220,y:50},{x:250,y:150},{x:150,y:170}];\nconst ZONES=[{id:'A',x1:0,y1:0,x2:160,y2:100},{id:'B',x1:160,y1:0,x2:300,y2:100},{id:'C',x1:0,y1:100,x2:100,y2:200},{id:'D',x1:100,y1:100,x2:300,y2:200}];\nfunction gz(x,y){for(const z of ZONES)if(x>=z.x1&&x<z.x2&&y>=z.y1&&y<z.y2)return z.id;return'A';}\nglobal.set('activePath',wps); global.set('activePathIndex',0); global.set('isFollowingPath',true);\nconst route=wps.map((w,i)=>`WP${i+1}:Zone ${gz(w.x,w.y)}`).join('→');\nmsg.payload={action:'path_planning',waypoints:wps,route,status:'following'};\nnode.status({fill:'blue',shape:'dot',text:`Path: ${wps.length} WPs`});\nreturn msg;","outputs":1,"noerr":0,"x":1090,"y":340,"wires":[["t4-delay-path"]]},
-  {"id":"t4-delay-path","type":"delay","z":"tab-4","name":"Path Travel (4s)","pauseType":"delay","timeout":"4","timeoutUnits":"seconds","rate":"1","nbRateUnits":"1","rateUnits":"second","randomFirst":"1","randomLast":"5","randomUnits":"seconds","drop":false,"allowrate":false,"x":1260,"y":340,"wires":[["t4-fn-drop"]]},
-  {"id":"t4-fn-drop","type":"function","z":"tab-4","name":"📤 Drop Payload","func":"let r=global.get('robot')||{};\nconst zone=global.get('currentZone')||'D';\nr.payload=false; global.set('robot',r);\nglobal.set('isFollowingPath',false); global.set('activePath',[]); global.set('activePathIndex',0);\nmsg.payload={action:'drop_payload',dropZone:zone,status:'dropped',carrying:false};\nnode.status({fill:'green',shape:'dot',text:`Dropped at Zone ${zone}`});\nreturn msg;","outputs":1,"noerr":0,"x":1430,"y":340,"wires":[["t4-debug-b"]]},
-  {"id":"t4-debug-b","type":"debug","z":"tab-4","name":"Chain B Output","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":1610,"y":340,"wires":[]},
-
-  {"id":"t4-cmt-c","type":"comment","z":"tab-4","name":"Chain C — Dock → Loop (2 iterations × Wait 3s)","info":"","x":300,"y":480,"wires":[]},
-  {"id":"t4-inject-c","type":"inject","z":"tab-4","name":"▶ Run Chain C","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"flow","payload":"{\"loopTarget\":2}","payloadType":"json","x":160,"y":530,"wires":[["t4-fn-dock-cmd"]]},
-  {"id":"t4-fn-dock-cmd","type":"function","z":"tab-4","name":"🔌 Dock Command","func":"let r=global.get('robot')||{};\nif(r.docked){msg.payload={action:'dock',status:'already_docked'}; return msg;}\nglobal.set('isDocking',true); global.set('isPatrolling',false);\nr.state='running'; global.set('robot',r);\nmsg.payload={action:'dock',status:'docking',loopTarget:msg.payload.loopTarget||2,loopCount:0};\nnode.status({fill:'blue',shape:'dot',text:'Docking…'});\nreturn msg;","outputs":1,"noerr":0,"x":360,"y":530,"wires":[["t4-delay-dock"]]},
-  {"id":"t4-delay-dock","type":"delay","z":"tab-4","name":"Dock Travel (3s)","pauseType":"delay","timeout":"3","timeoutUnits":"seconds","rate":"1","nbRateUnits":"1","rateUnits":"second","randomFirst":"1","randomLast":"5","randomUnits":"seconds","drop":false,"allowrate":false,"x":540,"y":530,"wires":[["t4-fn-loop"]]},
-  {"id":"t4-fn-loop","type":"function","z":"tab-4","name":"🔁 Loop Controller","func":"let lc = (msg.payload.loopCount||0)+1;\nconst lt = msg.payload.loopTarget||2;\nmsg.payload.loopCount = lc;\nnode.status({fill:'yellow',shape:'dot',text:`Iter ${lc}/${lt}`});\nif(lc <= lt){\n  msg.topic = 'loop_iteration';\n  return [msg, null];\n} else {\n  msg.topic = 'loop_done';\n  return [null, msg];\n}","outputs":2,"noerr":0,"x":720,"y":530,"wires":[["t4-delay-wait"],["t4-debug-c"]]},
-  {"id":"t4-delay-wait","type":"delay","z":"tab-4","name":"⏸ Wait 3s","pauseType":"delay","timeout":"3","timeoutUnits":"seconds","rate":"1","nbRateUnits":"1","rateUnits":"second","randomFirst":"1","randomLast":"5","randomUnits":"seconds","drop":false,"allowrate":false,"x":890,"y":510,"wires":[["t4-fn-loop"]]},
-  {"id":"t4-debug-c","type":"debug","z":"tab-4","name":"Chain C Output (loop done)","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":930,"y":555,"wires":[]},
-
-  {"id":"t4-cmt-d","type":"comment","z":"tab-4","name":"Chain D — Zone Detector (Zone D) → Emergency Stop → Auto-Reset 5s","info":"","x":350,"y":640,"wires":[]},
-  {"id":"t4-inject-d","type":"inject","z":"tab-4","name":"▶ Run Chain D","props":[{"p":"payload"},{"p":"topic","vt":"str"}],"repeat":"","crontab":"","once":false,"topic":"flow","payload":"","payloadType":"date","x":160,"y":690,"wires":[["t4-fn-zone-detector"]]},
-  {"id":"t4-fn-zone-detector","type":"function","z":"tab-4","name":"⬤ Zone Detector (watching D)","func":"const zone=global.get('currentZone')||'A';\nconst watchZone='D';\nmsg.payload={action:'zone_check',currentZone:zone,watchZone,matched:zone===watchZone};\nnode.status({fill:'blue',shape:'dot',text:`Zone: ${zone} | Watching: ${watchZone}`});\nreturn msg;","outputs":1,"noerr":0,"x":390,"y":690,"wires":[["t4-sw-zone"]]},
-  {"id":"t4-sw-zone","type":"switch","z":"tab-4","name":"Zone D?","property":"payload.matched","propertyType":"msg","rules":[{"t":"true"},{"t":"false"}],"checkall":"true","repair":false,"outputs":2,"x":630,"y":690,"wires":[["t4-fn-estop"],["t4-fn-zone-safe"]]},
-  {"id":"t4-fn-estop","type":"function","z":"tab-4","name":"🛑 Emergency Stop","func":"let r=global.get('robot')||{};\nr.speed=0; r.state='error';\nglobal.set('robot',r); global.set('isPatrolling',false); global.set('isDocking',false); global.set('isFollowingPath',false);\nmsg.payload={action:'emergency_stop',reason:`Entered danger Zone ${msg.payload.currentZone}`,resetAfter:5,timestamp:new Date().toISOString()};\nnode.status({fill:'red',shape:'ring',text:'EMERGENCY STOP ⚡'});\nreturn msg;","outputs":1,"noerr":0,"x":820,"y":665,"wires":[["t4-delay-reset"]]},
-  {"id":"t4-fn-zone-safe","type":"function","z":"tab-4","name":"✅ Zone OK","func":"msg.payload={action:'zone_safe',zone:msg.payload.currentZone,status:'ok'};\nnode.status({fill:'green',shape:'dot',text:'Safe zone'});\nreturn msg;","outputs":1,"noerr":0,"x":820,"y":720,"wires":[["t4-debug-d"]]},
-  {"id":"t4-delay-reset","type":"delay","z":"tab-4","name":"Auto-Reset (5s)","pauseType":"delay","timeout":"5","timeoutUnits":"seconds","rate":"1","nbRateUnits":"1","rateUnits":"second","randomFirst":"1","randomLast":"5","randomUnits":"seconds","drop":false,"allowrate":false,"x":1030,"y":665,"wires":[["t4-fn-auto-resume"]]},
-  {"id":"t4-fn-auto-resume","type":"function","z":"tab-4","name":"▶ Auto Resume","func":"let r=global.get('robot')||{};\nr.state='running'; r.speed=60; global.set('robot',r);\nmsg.payload={action:'auto_resume',speed:60,status:'resumed',timestamp:new Date().toISOString()};\nnode.status({fill:'green',shape:'dot',text:'Resumed at 60%'});\nreturn msg;","outputs":1,"noerr":0,"x":1220,"y":665,"wires":[["t4-debug-d"]]},
-  {"id":"t4-debug-d","type":"debug","z":"tab-4","name":"Chain D Output","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":1430,"y":685,"wires":[]},
-
-
-  {"id":"t5-cmt-1","type":"comment","z":"tab-5","name":"Alerts & Logging — routes incoming alerts by severity, outputs to debug console and event log","info":"Receives alerts from Tab 1 via link-in.\nRoutes by level: danger → error debug, warn → warning debug, info/ok → info debug.\nAll events pass through the event log formatter.","x":380,"y":40,"wires":[]},
-
-  {"id":"t5-link-in","type":"link in","z":"tab-5","name":"← Sensor Data","links":["t1-link-out-sensor"],"x":115,"y":120,"wires":[["t5-fn-format-status"]]},
-  {"id":"t5-fn-format-status","type":"function","z":"tab-5","name":"Format Status Line","func":"const d=msg.payload;\nif(!d||!d.sensors) return null;\nconst risk=d.riskScore||0;\nconst status = risk>70?'🔴 CRITICAL':risk>40?'🟡 ELEVATED':'🟢 NOMINAL';\nconst line=`[${new Date().toLocaleTimeString()}] ${status} | Zone:${d.currentZone} | Vib:${d.sensors.vib.toFixed(1)}% | Temp:${d.sensors.temp.toFixed(1)}°C | Batt:${d.robot.battery.toFixed(0)}% | Spd:${d.robot.speed}% | Risk:${risk.toFixed(0)}%`;\nmsg.payload=line; msg.topic='status_line';\nnode.status({fill:risk>70?'red':risk>40?'yellow':'green',shape:'dot',text:status});\nreturn msg;","outputs":1,"noerr":0,"x":330,"y":120,"wires":[["t5-debug-status"]]},
-  {"id":"t5-debug-status","type":"debug","z":"tab-5","name":"📊 Status Line","active":true,"tosidebar":true,"console":false,"tostatus":true,"complete":"payload","targetType":"msg","x":560,"y":120,"wires":[]},
-
-  {"id":"t5-link-in-alerts","type":"link in","z":"tab-5","name":"← Alerts","links":["t1-link-out-alerts"],"x":115,"y":240,"wires":[["t5-fn-split-alerts"]]},
-  {"id":"t5-fn-split-alerts","type":"function","z":"tab-5","name":"Enrich & Split Alerts","func":"const alerts=msg.payload||[];\nif(!alerts.length){\n  msg.payload={level:'ok',message:'✅ All systems normal',timestamp:new Date().toISOString()};\n  return [null,null,null,msg];\n}\nconst danger=alerts.filter(a=>a.level==='danger');\nconst warns =alerts.filter(a=>a.level==='warn');\nconst infos =alerts.filter(a=>a.level==='info');\nconst oks   =alerts.filter(a=>a.level==='ok');\nconst ts=new Date().toISOString();\nconst mk=(arr,label)=>arr.length?{payload:{alerts:arr,count:arr.length,label,timestamp:ts},topic:'alert'}:null;\nreturn [mk(danger,'DANGER'),mk(warns,'WARNING'),mk([...infos,...oks],'INFO/OK'),null];","outputs":4,"noerr":0,"x":330,"y":240,"wires":[["t5-debug-danger"],["t5-debug-warn"],["t5-debug-info"],["t5-debug-ok"]]},
-
-  {"id":"t5-debug-danger","type":"debug","z":"tab-5","name":"🔴 DANGER Alerts","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":590,"y":195,"wires":[]},
-  {"id":"t5-debug-warn","type":"debug","z":"tab-5","name":"🟡 WARNING Alerts","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":590,"y":240,"wires":[]},
-  {"id":"t5-debug-info","type":"debug","z":"tab-5","name":"🔵 INFO / OK","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":580,"y":285,"wires":[]},
-  {"id":"t5-debug-ok","type":"debug","z":"tab-5","name":"🟢 All Clear","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":575,"y":330,"wires":[]},
-
-  {"id":"t5-cmt-2","type":"comment","z":"tab-5","name":"Event Log — structured log of all motion and alert events","info":"","x":220,"y":420,"wires":[]},
-  {"id":"t5-fn-event-log","type":"function","z":"tab-5","name":"Format Event Log Entry","func":"const ts=new Date().toLocaleTimeString();\nlet entry;\nif(Array.isArray(msg.payload)){\n  entry=msg.payload.map(a=>`[${ts}] [${a.level?.toUpperCase()||'INFO'}] ${a.message||a.detail||JSON.stringify(a)}`).join('\\n');\n} else if(typeof msg.payload==='object'){\n  const p=msg.payload;\n  const lvl=(p.level||p.severity||'INFO').toUpperCase();\n  entry=`[${ts}] [${lvl}] ${p.message||p.action||p.event||JSON.stringify(p)}`;\n} else {\n  entry=`[${ts}] [INFO] ${msg.payload}`;\n}\nmsg.payload=entry; msg.topic='event_log';\nreturn msg;","outputs":1,"noerr":0,"x":340,"y":470,"wires":[["t5-debug-log"]]},
-  {"id":"t5-debug-log","type":"debug","z":"tab-5","name":"📋 Event Log","active":true,"tosidebar":true,"console":false,"tostatus":false,"complete":"payload","targetType":"msg","x":570,"y":470,"wires":[]}
+  {
+    "id": "tab-1",
+    "type": "tab",
+    "label": "🤖 Sensor Simulation",
+    "disabled": false,
+    "info": "Main simulation loop - runs every 1.5s. All robot state stored in global context."
+  },
+  {
+    "id": "tab-2",
+    "type": "tab",
+    "label": "⚙️ Template Automations",
+    "disabled": false,
+    "info": "5 pre-built automation templates (Heat Guard, Low Battery, Vib Shield, Predictive Maint, Smart Nav). Use inject nodes to activate/deactivate each."
+  },
+  {
+    "id": "tab-3",
+    "type": "tab",
+    "label": "🚀 Motion Control",
+    "disabled": false,
+    "info": "All robot movement commands: start/stop/e-stop, directional control, dock, patrol, waypoint, path planning."
+  },
+  {
+    "id": "tab-4",
+    "type": "tab",
+    "label": "🔧 Flow Engine (Demo)",
+    "disabled": false,
+    "info": "Visual flow programming equivalent. Four demo chains showing all node types."
+  },
+  {
+    "id": "tab-5",
+    "type": "tab",
+    "label": "🚨 Alerts & Logging",
+    "disabled": false,
+    "info": "Consolidated alerts routed by severity. Full event log."
+  },
+  {
+    "id": "t1-cmt-1",
+    "type": "comment",
+    "z": "tab-1",
+    "name": "NeuroFlow HMI — Node-RED Conversion | Tick: 1.5 s | State: global context",
+    "info": "All robot and sensor state lives in Node-RED global context.\nAccess anywhere with global.get('key') / global.set('key', value).\n\nKey globals:\n  robot     : {x,y,angle,speed,battery,payload,docked,state}\n  sensors   : {vib, temp}\n  activeTemplates : string[]\n  speedLimit, riskScore, predAlert\n  vibHistory, tempHistory (rolling 120-point arrays)\n  isPatrolling, isDocking, isFollowingPath\n  activePath, activePathIndex, patrolIndex\n  currentZone, lastZone, vibTrend",
+    "x": 280,
+    "y": 40,
+    "wires": []
+  },
+  {
+    "id": "t1-inject-init",
+    "type": "inject",
+    "z": "tab-1",
+    "name": "🚀 Initialize State (runs once)",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "0.1",
+    "topic": "init",
+    "payload": "",
+    "payloadType": "date",
+    "x": 190,
+    "y": 120,
+    "wires": [
+      [
+        "t1-fn-init"
+      ]
+    ]
+  },
+  {
+    "id": "t1-fn-init",
+    "type": "function",
+    "z": "tab-1",
+    "name": "Initialize Global State",
+    "func": "global.set('robot', {\n  x:140, y:95, angle:0, speed:100, battery:98,\n  payload:false, docked:false, dockedStation:null, state:'running'\n});\nglobal.set('sensors', {vib:22, temp:36.2});\nglobal.set('activeTemplates', []);\nglobal.set('speedLimit', 100);\nglobal.set('riskScore', 0);\nglobal.set('predAlert', false);\nglobal.set('vibHistory', []);\nglobal.set('tempHistory', []);\nglobal.set('isPatrolling', false);\nglobal.set('isDocking', false);\nglobal.set('isFollowingPath', false);\nglobal.set('activePath', []);\nglobal.set('activePathIndex', 0);\nglobal.set('patrolIndex', 0);\nglobal.set('currentZone', 'A');\nglobal.set('lastZone', 'A');\nglobal.set('vibTrend', 'stable');\nglobal.set('waypointSet', false);\nglobal.set('waypointX', 0);\nglobal.set('waypointY', 0);\nnode.status({fill:'green', shape:'dot', text:'Initialized ✓'});\nmsg.payload = {status:'initialized', timestamp:new Date().toISOString()};\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 430,
+    "y": 120,
+    "wires": [
+      [
+        "t1-debug-init"
+      ]
+    ]
+  },
+  {
+    "id": "t1-debug-init",
+    "type": "debug",
+    "z": "tab-1",
+    "name": "✅ Init Complete",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 660,
+    "y": 120,
+    "wires": []
+  },
+  {
+    "id": "t1-cmt-2",
+    "type": "comment",
+    "z": "tab-1",
+    "name": "Main Simulation Tick — 1.5 s",
+    "info": "Simulates sensor drift, battery drain, robot position drift, docking/charging, patrol and path-following movement. Emits sensor_update on output 1 and motion_event / zone_change on output 2.",
+    "x": 230,
+    "y": 195,
+    "wires": []
+  },
+  {
+    "id": "t1-inject-tick",
+    "type": "inject",
+    "z": "tab-1",
+    "name": "⏱ Tick (1.5 s)",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "1.5",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "0.5",
+    "topic": "tick",
+    "payload": "",
+    "payloadType": "date",
+    "x": 160,
+    "y": 260,
+    "wires": [
+      [
+        "t1-fn-simulate"
+      ]
+    ]
+  },
+  {
+    "id": "t1-fn-simulate",
+    "type": "function",
+    "z": "tab-1",
+    "name": "Simulate Sensors & Robot State",
+    "func": "// ── Retrieve state ──\nlet s  = global.get('sensors')  || {vib:22, temp:36.2};\nlet r  = global.get('robot')    || {x:140,y:95,angle:0,speed:100,battery:98,payload:false,docked:false,state:'running'};\nlet sl = global.get('speedLimit') || 100;\nlet vH = global.get('vibHistory')  || [];\nlet tH = global.get('tempHistory') || [];\nlet isPat = global.get('isPatrolling')   || false;\nlet isDk  = global.get('isDocking')      || false;\nlet isPath= global.get('isFollowingPath')|| false;\nlet aPath = global.get('activePath')     || [];\nlet aIdx  = global.get('activePathIndex')|| 0;\nlet pIdx  = global.get('patrolIndex')    || 0;\nconst DOCK_X=50, DOCK_Y=150;\nconst PATROL=[{x:80,y:50},{x:220,y:50},{x:250,y:150},{x:150,y:170},{x:50,y:150},{x:80,y:50}];\n\nconst events = [];\n\n// ── Helper: move robot one step toward target ──\nfunction moveTowards(tx, ty, speed) {\n  const dx=tx-r.x, dy=ty-r.y;\n  const dist=Math.sqrt(dx*dx+dy*dy);\n  if (dist \u003C 4) return true;\n  r.angle = Math.atan2(dy,dx);\n  r.x += dx/dist*Math.min(speed,dist);\n  r.y += dy/dist*Math.min(speed,dist);\n  return false;\n}\n\n// ── Helper: determine zone ──\nconst ZONES=[{id:'A',x1:0,y1:0,x2:160,y2:100},{id:'B',x1:160,y1:0,x2:300,y2:100},{id:'C',x1:0,y1:100,x2:100,y2:200},{id:'D',x1:100,y1:100,x2:300,y2:200}];\nfunction getZone(x,y){for(const z of ZONES)if(x\u003E=z.x1&&x\u003Cz.x2&&y\u003E=z.y1&&y\u003Cz.y2)return z.id;return 'A';}\n\nif (!r.docked) {\n  // Sensor drift\n  s.vib  = Math.min(100, Math.max(0, s.vib  + (Math.random()-0.5)*5));\n  s.temp = Math.min(80,  Math.max(20, s.temp + (Math.random()-0.5)*1.2));\n  if (r.state==='running') r.battery = Math.max(0, r.battery - Math.random()*0.18);\n  if (Math.random()\u003C0.025)  r.payload = !r.payload;\n\n  if (r.state === 'running') {\n    if (isPath && aPath.length \u003E 0) {\n      if (moveTowards(aPath[aIdx].x, aPath[aIdx].y, (sl/100)*3.5)) {\n        aIdx++;\n        if (aIdx \u003E= aPath.length) {\n          isPath=false; aPath=[]; aIdx=0;\n          events.push({event:'path_complete', msg:'All waypoints reached'});\n        } else {\n          events.push({event:'waypoint_reached', index:aIdx, next:aPath[aIdx]});\n        }\n        global.set('activePath',aPath); global.set('activePathIndex',aIdx); global.set('isFollowingPath',isPath);\n      }\n    } else if (isDk) {\n      if (moveTowards(DOCK_X, DOCK_Y, (sl/100)*3)) {\n        r.docked=true; r.dockedStation='Charging Station'; r.state='idle';\n        isDk=false; global.set('isDocking',false);\n        events.push({event:'docked', station:'Charging Station'});\n      }\n    } else if (global.get('waypointSet')) {\n      const wx=global.get('waypointX'), wy=global.get('waypointY');\n      if (moveTowards(wx, wy, (sl/100)*3.5)) {\n        global.set('waypointSet',false);\n        events.push({event:'waypoint_arrived', zone:getZone(wx,wy)});\n      }\n    } else if (isPat) {\n      if (moveTowards(PATROL[pIdx%PATROL.length].x, PATROL[pIdx%PATROL.length].y, (sl/100)*3)) {\n        pIdx++; global.set('patrolIndex',pIdx);\n        events.push({event:'patrol_waypoint', index:pIdx});\n      }\n    } else {\n      // Free drift\n      r.x = Math.min(295,Math.max(5, r.x+(Math.random()-0.5)*5*(sl/100)));\n      r.y = Math.min(195,Math.max(5, r.y+(Math.random()-0.5)*5*(sl/100)));\n    }\n    r.speed = Math.min(sl, r.speed+1);\n  }\n} else {\n  // Charging at dock\n  r.battery = Math.min(100, r.battery+0.5);\n  s.temp    = Math.max(20,  s.temp-0.2);\n  s.vib     = Math.max(0,   s.vib-1);\n}\n\n// ── Update histories ──\nvH.push(s.vib); tH.push(s.temp);\nif(vH.length\u003E120) vH.shift(); if(tH.length\u003E120) tH.shift();\n\n// ── Risk score ──\nconst risk = Math.min(100, s.vib*0.6 + Math.max(0,s.temp-40)*1.5);\n\n// ── Predictive alert ──\nlet predAlert = global.get('predAlert') || false;\nif(s.vib\u003E65 && !predAlert) predAlert=true;\nelse if(s.vib\u003C48) predAlert=false;\n\n// ── Zone detection ──\nconst zone    = getZone(r.x, r.y);\nconst lastZone= global.get('lastZone') || 'A';\nif(zone !== lastZone) {\n  events.push({event:'zone_change', from:lastZone, to:zone});\n  global.set('lastZone', zone);\n}\n\n// ── Vibration trend ──\nlet trend='stable';\nif(vH.length\u003E=8){const d=vH[vH.length-1]-vH[vH.length-8];if(d\u003E6)trend='rising sharply';else if(d\u003E2)trend='rising';}\n\n// ── Save global state ──\nglobal.set('sensors',s); global.set('robot',r); global.set('riskScore',risk);\nglobal.set('predAlert',predAlert); global.set('vibHistory',vH); global.set('tempHistory',tH);\nglobal.set('currentZone',zone); global.set('vibTrend',trend);\n\nconst sensorMsg = {payload:{sensors:s,robot:r,riskScore:risk,predAlert,currentZone:zone,trend,timestamp:new Date().toISOString()},topic:'sensor_update'};\nconst eventMsg  = events.length ? {payload:events,topic:'motion_events'} : null;\n\nnode.status({fill:risk\u003E70?'red':risk\u003E40?'yellow':'green',shape:'dot',text:`V:${s.vib.toFixed(1)} T:${s.temp.toFixed(1)} R:${risk.toFixed(0)}%`});\nreturn [sensorMsg, eventMsg];",
+    "outputs": 2,
+    "noerr": 0,
+    "x": 400,
+    "y": 260,
+    "wires": [
+      [
+        "t1-link-out-sensor",
+        "t1-fn-templates",
+        "t1-fn-alerts",
+        "t1-debug-sensor"
+      ],
+      [
+        "t1-debug-events"
+      ]
+    ]
+  },
+  {
+    "id": "t1-link-out-sensor",
+    "type": "link out",
+    "z": "tab-1",
+    "name": "→ Sensor Data (all tabs)",
+    "links": [
+      "t2-link-in",
+      "t5-link-in"
+    ],
+    "x": 700,
+    "y": 240,
+    "wires": []
+  },
+  {
+    "id": "t1-fn-templates",
+    "type": "function",
+    "z": "tab-1",
+    "name": "Apply Active Templates",
+    "func": "const s  = global.get('sensors')       || {};\nlet   r  = global.get('robot')          || {};\nconst tpl= global.get('activeTemplates')|| [];\nconst sl = global.get('speedLimit')     || 100;\nconst pred=global.get('predAlert')      || false;\nconst msgs = [];\n\n// 1. Heat Guard\nif(tpl.includes('heat') && s.temp\u003E55 && r.speed\u003E60){\n  r.speed=60;\n  msgs.push({payload:{template:'heat',action:'speed_capped',value:60,reason:`Temp ${s.temp.toFixed(1)}°C \u003E 55°C`},topic:'template_action'});\n}\n// 2. Low Battery Return\nif(tpl.includes('batt') && r.battery\u003C20 && r.state==='running' && !r.docked && !global.get('isDocking')){\n  global.set('isDocking',true);\n  msgs.push({payload:{template:'batt',action:'auto_docking',reason:`Battery ${r.battery.toFixed(0)}% \u003C 20%`},topic:'template_action'});\n}\n// 3. Vibration Shield\nif(tpl.includes('vib') && s.vib\u003E70 && r.speed\u003E50){\n  r.speed=50;\n  msgs.push({payload:{template:'vib',action:'speed_capped',value:50,reason:`Vib ${s.vib.toFixed(1)}% \u003E 70%`},topic:'template_action'});\n}\n// 4. Smart Navigation (stochastic obstacle avoidance)\nif(tpl.includes('nav') && Math.random()\u003C0.05){\n  r.angle=(r.angle||0)+(Math.random()-0.5)*0.3;\n  msgs.push({payload:{template:'nav',action:'rerouting',reason:'Obstacle detected within 1.5 m'},topic:'template_action'});\n}\n// 5. Predictive Maintenance\nif(tpl.includes('maint') && pred && Math.random()\u003C0.1){\n  msgs.push({payload:{template:'maint',action:'maintenance_advisory',reason:'Vibration trend indicates bearing failure risk'},topic:'template_action'});\n}\n\nglobal.set('robot',r);\nif(!msgs.length) return null;\nreturn msgs;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 410,
+    "y": 340,
+    "wires": [
+      [
+        "t1-debug-template-action"
+      ]
+    ]
+  },
+  {
+    "id": "t1-debug-template-action",
+    "type": "debug",
+    "z": "tab-1",
+    "name": "⚙️ Template Actions",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 670,
+    "y": 340,
+    "wires": []
+  },
+  {
+    "id": "t1-fn-alerts",
+    "type": "function",
+    "z": "tab-1",
+    "name": "Generate Alert List",
+    "func": "const s    = global.get('sensors')  || {};\nconst r    = global.get('robot')    || {};\nconst risk = global.get('riskScore')|| 0;\nconst pred = global.get('predAlert')|| false;\nconst isDk = global.get('isDocking')|| false;\nconst isPat= global.get('isPatrolling')||false;\nconst isPath=global.get('isFollowingPath')||false;\nconst aPath=global.get('activePath')||[];\nconst aIdx=global.get('activePathIndex')||0;\nconst alerts=[];\n\nif(s.temp\u003E58) alerts.push({level:'danger',type:'temp',   message:`🔥 Critical temp: ${s.temp.toFixed(1)}°C — shutdown risk`});\nelse if(s.temp\u003E45) alerts.push({level:'warn',type:'temp',message:`🌡️ High temp: ${s.temp.toFixed(1)}°C — monitor closely`});\n\nif(s.vib\u003E70) alerts.push({level:'danger',type:'vib',    message:`📳 Critical vibration: ${s.vib.toFixed(1)}% — reduce speed`});\nelse if(s.vib\u003E40) alerts.push({level:'warn',type:'vib', message:`⚡ Elevated vibration: ${s.vib.toFixed(1)}%`});\n\nif(r.battery\u003C20) alerts.push({level:'danger',type:'batt',message:`🔋 Critical battery: ${r.battery.toFixed(0)}% — return to charger`});\nelse if(r.battery\u003C35) alerts.push({level:'warn',type:'batt',message:`🔋 Low battery: ${r.battery.toFixed(0)}%`});\n\nif(pred) alerts.push({level:'warn',type:'predictive',   message:'🔮 Predictive: motor failure risk rising'});\nif(r.state==='error') alerts.push({level:'danger',type:'system',message:'🚨 Robot in error state — manual intervention required'});\nif(r.docked) alerts.push({level:'ok',type:'dock',        message:`⚡ Docked at ${r.dockedStation||'station'} — charging`});\nif(isDk) alerts.push({level:'info',type:'dock',           message:'🔌 Docking — navigating to charging station'});\nif(isPat) alerts.push({level:'info',type:'patrol',        message:'🔁 Patrol route active'});\nif(isPath) alerts.push({level:'info',type:'path',         message:`🗺️ Path following — WP ${aIdx+1}/${aPath.length}`});\n\nnode.status({fill:alerts.some(a=\u003Ea.level==='danger')?'red':alerts.length\u003E0?'yellow':'green',shape:'dot',text:`${alerts.length} alerts`});\nmsg.payload=alerts; msg.topic='alerts';\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 410,
+    "y": 410,
+    "wires": [
+      [
+        "t1-link-out-alerts",
+        "t1-debug-alerts"
+      ]
+    ]
+  },
+  {
+    "id": "t1-link-out-alerts",
+    "type": "link out",
+    "z": "tab-1",
+    "name": "→ Alerts Tab",
+    "links": [
+      "t5-link-in-alerts"
+    ],
+    "x": 680,
+    "y": 395,
+    "wires": []
+  },
+  {
+    "id": "t1-debug-alerts",
+    "type": "debug",
+    "z": "tab-1",
+    "name": "🚨 Alerts",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 660,
+    "y": 430,
+    "wires": []
+  },
+  {
+    "id": "t1-debug-sensor",
+    "type": "debug",
+    "z": "tab-1",
+    "name": "📊 Sensor State (verbose)",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 700,
+    "y": 270,
+    "wires": []
+  },
+  {
+    "id": "t1-debug-events",
+    "type": "debug",
+    "z": "tab-1",
+    "name": "🗺️ Motion Events",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 680,
+    "y": 295,
+    "wires": []
+  },
+  {
+    "id": "t1-cmt-3",
+    "type": "comment",
+    "z": "tab-1",
+    "name": "Fault Injection — manually spike sensors for testing",
+    "info": "Use the inject below to artificially drive vibration to 88% to test template and alert firing.",
+    "x": 280,
+    "y": 490,
+    "wires": []
+  },
+  {
+    "id": "t1-inject-fault",
+    "type": "inject",
+    "z": "tab-1",
+    "name": "⚡ Inject Fault (vib→88%)",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "fault",
+    "payload": "{\"vib\":88}",
+    "payloadType": "json",
+    "x": 200,
+    "y": 540,
+    "wires": [
+      [
+        "t1-fn-fault"
+      ]
+    ]
+  },
+  {
+    "id": "t1-fn-fault",
+    "type": "function",
+    "z": "tab-1",
+    "name": "Apply Fault Override",
+    "func": "let s = global.get('sensors') || {};\nif(msg.payload.vib !== undefined) s.vib = msg.payload.vib;\nif(msg.payload.temp !== undefined) s.temp = msg.payload.temp;\nglobal.set('sensors',s);\nmsg.payload={status:'fault_injected',sensors:s};\nnode.status({fill:'red',shape:'ring',text:`Fault: vib=${s.vib}%`});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 430,
+    "y": 540,
+    "wires": [
+      [
+        "t1-debug-fault"
+      ]
+    ]
+  },
+  {
+    "id": "t1-debug-fault",
+    "type": "debug",
+    "z": "tab-1",
+    "name": "Fault Applied",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 650,
+    "y": 540,
+    "wires": []
+  },
+  {
+    "id": "t1-inject-reset-sensors",
+    "type": "inject",
+    "z": "tab-1",
+    "name": "🔄 Reset Sensors to Normal",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "reset",
+    "payload": "{\"vib\":22,\"temp\":36.2}",
+    "payloadType": "json",
+    "x": 200,
+    "y": 590,
+    "wires": [
+      [
+        "t1-fn-fault"
+      ]
+    ]
+  },
+  {
+    "id": "t2-cmt-1",
+    "type": "comment",
+    "z": "tab-2",
+    "name": "Template Automations — activate/deactivate with inject nodes below",
+    "info": "Each template monitors the live sensor snapshot forwarded from Tab 1.\n\nTemplates:\n  heat   — Prevent Overheating: speed → 60% when temp \u003E 55°C\n  batt   — Low Battery Return: auto-dock when battery \u003C 20%\n  vib    — Avoid High Vibration: speed → 50% when vib \u003E 70%\n  maint  — Predictive Maintenance: advisory log when failure predicted\n  nav    — Smart Navigation: stochastic obstacle rerouting",
+    "x": 360,
+    "y": 40,
+    "wires": []
+  },
+  {
+    "id": "t2-inject-act-heat",
+    "type": "inject",
+    "z": "tab-2",
+    "name": "🟢 Activate: Heat Guard",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "activate",
+    "payload": "heat",
+    "payloadType": "str",
+    "x": 190,
+    "y": 120,
+    "wires": [
+      [
+        "t2-fn-toggle"
+      ]
+    ]
+  },
+  {
+    "id": "t2-inject-dea-heat",
+    "type": "inject",
+    "z": "tab-2",
+    "name": "🔴 Deactivate: Heat Guard",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "deactivate",
+    "payload": "heat",
+    "payloadType": "str",
+    "x": 190,
+    "y": 160,
+    "wires": [
+      [
+        "t2-fn-toggle"
+      ]
+    ]
+  },
+  {
+    "id": "t2-inject-act-batt",
+    "type": "inject",
+    "z": "tab-2",
+    "name": "🟢 Activate: Low Battery Return",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "activate",
+    "payload": "batt",
+    "payloadType": "str",
+    "x": 190,
+    "y": 220,
+    "wires": [
+      [
+        "t2-fn-toggle"
+      ]
+    ]
+  },
+  {
+    "id": "t2-inject-dea-batt",
+    "type": "inject",
+    "z": "tab-2",
+    "name": "🔴 Deactivate: Low Battery Return",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "deactivate",
+    "payload": "batt",
+    "payloadType": "str",
+    "x": 190,
+    "y": 260,
+    "wires": [
+      [
+        "t2-fn-toggle"
+      ]
+    ]
+  },
+  {
+    "id": "t2-inject-act-vib",
+    "type": "inject",
+    "z": "tab-2",
+    "name": "🟢 Activate: Vib Shield",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "activate",
+    "payload": "vib",
+    "payloadType": "str",
+    "x": 180,
+    "y": 320,
+    "wires": [
+      [
+        "t2-fn-toggle"
+      ]
+    ]
+  },
+  {
+    "id": "t2-inject-dea-vib",
+    "type": "inject",
+    "z": "tab-2",
+    "name": "🔴 Deactivate: Vib Shield",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "deactivate",
+    "payload": "vib",
+    "payloadType": "str",
+    "x": 180,
+    "y": 360,
+    "wires": [
+      [
+        "t2-fn-toggle"
+      ]
+    ]
+  },
+  {
+    "id": "t2-inject-act-maint",
+    "type": "inject",
+    "z": "tab-2",
+    "name": "🟢 Activate: Predictive Maint",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "activate",
+    "payload": "maint",
+    "payloadType": "str",
+    "x": 190,
+    "y": 420,
+    "wires": [
+      [
+        "t2-fn-toggle"
+      ]
+    ]
+  },
+  {
+    "id": "t2-inject-dea-maint",
+    "type": "inject",
+    "z": "tab-2",
+    "name": "🔴 Deactivate: Predictive Maint",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "deactivate",
+    "payload": "maint",
+    "payloadType": "str",
+    "x": 190,
+    "y": 460,
+    "wires": [
+      [
+        "t2-fn-toggle"
+      ]
+    ]
+  },
+  {
+    "id": "t2-inject-act-nav",
+    "type": "inject",
+    "z": "tab-2",
+    "name": "🟢 Activate: Smart Navigation",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "activate",
+    "payload": "nav",
+    "payloadType": "str",
+    "x": 190,
+    "y": 520,
+    "wires": [
+      [
+        "t2-fn-toggle"
+      ]
+    ]
+  },
+  {
+    "id": "t2-inject-dea-nav",
+    "type": "inject",
+    "z": "tab-2",
+    "name": "🔴 Deactivate: Smart Navigation",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "deactivate",
+    "payload": "nav",
+    "payloadType": "str",
+    "x": 190,
+    "y": 560,
+    "wires": [
+      [
+        "t2-fn-toggle"
+      ]
+    ]
+  },
+  {
+    "id": "t2-fn-toggle",
+    "type": "function",
+    "z": "tab-2",
+    "name": "Toggle Template State",
+    "func": "const id  = msg.payload;\nconst act = msg.topic === 'activate';\nlet tpl   = global.get('activeTemplates') || [];\nconst nameMap = {heat:'Prevent Overheating',batt:'Low Battery Return',vib:'Avoid High Vibration',maint:'Predictive Maintenance',nav:'Smart Navigation'};\n\nif(act && !tpl.includes(id)) tpl.push(id);\nif(!act) tpl = tpl.filter(t =\u003E t !== id);\nglobal.set('activeTemplates', tpl);\n\nmsg.payload = {template:id, name:nameMap[id]||id, active:act, activeTemplates:tpl};\nmsg.topic   = 'template_toggle';\nnode.status({fill:act?'green':'grey', shape:'dot', text:`${id}: ${act?'ON':'OFF'} | Active: [${tpl.join(',')}]`});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 470,
+    "y": 340,
+    "wires": [
+      [
+        "t2-debug-toggle"
+      ]
+    ]
+  },
+  {
+    "id": "t2-debug-toggle",
+    "type": "debug",
+    "z": "tab-2",
+    "name": "Template State",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 680,
+    "y": 340,
+    "wires": []
+  },
+  {
+    "id": "t2-link-in",
+    "type": "link in",
+    "z": "tab-2",
+    "name": "← Sensor Data",
+    "links": [
+      "t1-link-out-sensor"
+    ],
+    "x": 115,
+    "y": 660,
+    "wires": [
+      [
+        "t2-fn-evaluate"
+      ]
+    ]
+  },
+  {
+    "id": "t2-fn-evaluate",
+    "type": "function",
+    "z": "tab-2",
+    "name": "Evaluate Templates Against Sensor Data",
+    "func": "const d   = msg.payload;\nconst tpl = global.get('activeTemplates') || [];\nif(!tpl.length) return null;\n\nconst results = [];\n\n// Heat Guard\nif(tpl.includes('heat')){\n  const firing = d.sensors.temp \u003E 55;\n  results.push({template:'heat',label:'🌡️ Heat Guard',firing,detail:`Temp ${d.sensors.temp.toFixed(1)}°C ${firing?'\u003E 55°C ⚡ TRIGGERED':'≤ 55°C OK'}`});\n}\n// Low Battery Return\nif(tpl.includes('batt')){\n  const firing = d.robot.battery \u003C 20;\n  results.push({template:'batt',label:'🔋 Low Battery Return',firing,detail:`Battery ${d.robot.battery.toFixed(0)}% ${firing?'\u003C 20% ⚡ DOCKING':'≥ 20% OK'}`});\n}\n// Vib Shield\nif(tpl.includes('vib')){\n  const firing = d.sensors.vib \u003E 70;\n  results.push({template:'vib',label:'📳 Vib Shield',firing,detail:`Vib ${d.sensors.vib.toFixed(1)}% ${firing?'\u003E 70% ⚡ SPEED CAP':'≤ 70% OK'}`});\n}\n// Predictive Maintenance\nif(tpl.includes('maint')){\n  const firing = d.predAlert;\n  results.push({template:'maint',label:'🔧 Predictive Maint',firing,detail:`Trend: ${d.trend} ${firing?'⚡ ADVISORY':'– OK'}`});\n}\n// Smart Navigation\nif(tpl.includes('nav')){\n  const firing = Math.random()\u003C0.05; // simulated obstacle detection\n  results.push({template:'nav',label:'🧠 Smart Nav',firing,detail:`Obstacle scan ${firing?'⚡ REROUTING':'– clear'}`});\n}\n\nconst firing = results.filter(r=\u003Er.firing);\nnode.status({fill:firing.length?'red':'green',shape:'dot',text:`${firing.length}/${results.length} templates firing`});\nmsg.payload = {results, firing, timestamp:d.timestamp};\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 370,
+    "y": 660,
+    "wires": [
+      [
+        "t2-debug-eval"
+      ]
+    ]
+  },
+  {
+    "id": "t2-debug-eval",
+    "type": "debug",
+    "z": "tab-2",
+    "name": "📊 Template Evaluation",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 650,
+    "y": 660,
+    "wires": []
+  },
+  {
+    "id": "t3-cmt-1",
+    "type": "comment",
+    "z": "tab-3",
+    "name": "Motion Control — inject a command to change robot state",
+    "info": "All commands write to global context 'robot' and motion flags.\nThe simulation tick in Tab 1 reads these flags each cycle to determine movement.",
+    "x": 310,
+    "y": 40,
+    "wires": []
+  },
+  {
+    "id": "t3-cmt-2",
+    "type": "comment",
+    "z": "tab-3",
+    "name": "─── State Commands ───",
+    "info": "",
+    "x": 170,
+    "y": 90,
+    "wires": []
+  },
+  {
+    "id": "t3-inject-start",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "▶ Start Robot",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "cmd",
+    "payload": "start",
+    "payloadType": "str",
+    "x": 160,
+    "y": 140,
+    "wires": [
+      [
+        "t3-fn-state-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-inject-stop",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "⏹ Stop Robot",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "cmd",
+    "payload": "stop",
+    "payloadType": "str",
+    "x": 160,
+    "y": 185,
+    "wires": [
+      [
+        "t3-fn-state-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-inject-estop",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "🛑 EMERGENCY STOP",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "cmd",
+    "payload": "estop",
+    "payloadType": "str",
+    "x": 160,
+    "y": 230,
+    "wires": [
+      [
+        "t3-fn-state-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-inject-manual",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "🕹️ Manual Mode",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "cmd",
+    "payload": "manual",
+    "payloadType": "str",
+    "x": 160,
+    "y": 275,
+    "wires": [
+      [
+        "t3-fn-state-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-inject-reset",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "🔄 Reset Robot",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "cmd",
+    "payload": "reset",
+    "payloadType": "str",
+    "x": 160,
+    "y": 320,
+    "wires": [
+      [
+        "t3-fn-state-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-fn-state-cmd",
+    "type": "function",
+    "z": "tab-3",
+    "name": "Handle State Command",
+    "func": "let r  = global.get('robot')    || {};\nlet sl = global.get('speedLimit') || 100;\nconst cmd = msg.payload;\nswitch(cmd){\n  case 'start':\n    r.state='running'; r.speed=Math.min(sl,100); r.docked=false;\n    global.set('isDocking',false); global.set('isPatrolling',false);\n    node.status({fill:'green',shape:'dot',text:'Running'});\n    break;\n  case 'stop':\n    r.state='idle'; r.speed=0;\n    global.set('isPatrolling',false); global.set('isDocking',false); global.set('isFollowingPath',false);\n    node.status({fill:'grey',shape:'dot',text:'Stopped'});\n    break;\n  case 'estop':\n    r.state='error'; r.speed=0;\n    global.set('isPatrolling',false); global.set('isDocking',false); global.set('isFollowingPath',false);\n    node.status({fill:'red',shape:'ring',text:'EMERGENCY STOP'});\n    break;\n  case 'manual':\n    r.state='running'; r.docked=false;\n    node.status({fill:'blue',shape:'dot',text:'Manual'});\n    break;\n  case 'reset':\n    r.state='running'; r.speed=100; r.x=140; r.y=95; r.angle=0;\n    r.docked=false; r.dockedStation=null; r.payload=false;\n    global.set('speedLimit',100); global.set('isPatrolling',false);\n    global.set('isDocking',false); global.set('isFollowingPath',false);\n    global.set('activePath',[]); global.set('activePathIndex',0);\n    global.set('waypointSet',false);\n    let s=global.get('sensors')||{}; s.vib=22; s.temp=36.2; global.set('sensors',s);\n    node.status({fill:'green',shape:'dot',text:'Reset to defaults'});\n    break;\n}\nglobal.set('robot',r);\nmsg.payload={cmd,robot:r,timestamp:new Date().toISOString()};\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 450,
+    "y": 230,
+    "wires": [
+      [
+        "t3-debug-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-cmt-3",
+    "type": "comment",
+    "z": "tab-3",
+    "name": "─── Speed Limit ───",
+    "info": "",
+    "x": 170,
+    "y": 390,
+    "wires": []
+  },
+  {
+    "id": "t3-inject-speed20",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "🐢 Speed Limit → 20%",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "speed",
+    "payload": "20",
+    "payloadType": "num",
+    "x": 170,
+    "y": 430,
+    "wires": [
+      [
+        "t3-fn-speed"
+      ]
+    ]
+  },
+  {
+    "id": "t3-inject-speed50",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "🚶 Speed Limit → 50%",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "speed",
+    "payload": "50",
+    "payloadType": "num",
+    "x": 170,
+    "y": 470,
+    "wires": [
+      [
+        "t3-fn-speed"
+      ]
+    ]
+  },
+  {
+    "id": "t3-inject-speed100",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "⚡ Speed Limit → 100%",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "speed",
+    "payload": "100",
+    "payloadType": "num",
+    "x": 170,
+    "y": 510,
+    "wires": [
+      [
+        "t3-fn-speed"
+      ]
+    ]
+  },
+  {
+    "id": "t3-fn-speed",
+    "type": "function",
+    "z": "tab-3",
+    "name": "Set Speed Limit",
+    "func": "const v = parseInt(msg.payload);\nglobal.set('speedLimit', v);\nlet r = global.get('robot') || {};\nr.speed = Math.min(r.speed, v);\nglobal.set('robot',r);\nnode.status({fill:'blue',shape:'dot',text:`Limit: ${v}%`});\nmsg.payload={speedLimit:v,robotSpeed:r.speed};\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 440,
+    "y": 470,
+    "wires": [
+      [
+        "t3-debug-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-cmt-4",
+    "type": "comment",
+    "z": "tab-3",
+    "name": "─── Navigation Commands ───",
+    "info": "",
+    "x": 190,
+    "y": 580,
+    "wires": []
+  },
+  {
+    "id": "t3-inject-dock",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "🔌 Return to Dock",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "nav",
+    "payload": "dock",
+    "payloadType": "str",
+    "x": 160,
+    "y": 630,
+    "wires": [
+      [
+        "t3-fn-nav-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-inject-patrol",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "🔁 Toggle Patrol",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "nav",
+    "payload": "patrol",
+    "payloadType": "str",
+    "x": 160,
+    "y": 675,
+    "wires": [
+      [
+        "t3-fn-nav-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-inject-spin",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "🌀 360° Scan",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "nav",
+    "payload": "spin",
+    "payloadType": "str",
+    "x": 155,
+    "y": 720,
+    "wires": [
+      [
+        "t3-fn-nav-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-inject-waypoint",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "📍 Set Random Waypoint",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "nav",
+    "payload": "waypoint",
+    "payloadType": "str",
+    "x": 180,
+    "y": 765,
+    "wires": [
+      [
+        "t3-fn-nav-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-fn-nav-cmd",
+    "type": "function",
+    "z": "tab-3",
+    "name": "Handle Navigation Command",
+    "func": "const cmd = msg.payload;\nlet r = global.get('robot') || {};\nif(r.state==='error') { node.warn('Cannot nav — robot in error state'); return null; }\nswitch(cmd){\n  case 'dock':\n    r.state='running'; r.docked=false;\n    global.set('isDocking',true); global.set('isPatrolling',false); global.set('isFollowingPath',false);\n    node.status({fill:'blue',shape:'dot',text:'Docking…'});\n    break;\n  case 'patrol':\n    const was = global.get('isPatrolling') || false;\n    global.set('isPatrolling',!was); global.set('isDocking',false); global.set('patrolIndex',0);\n    node.status({fill:!was?'green':'grey',shape:'dot',text:!was?'Patrolling':'Patrol OFF'});\n    break;\n  case 'spin':\n    r.angle = (r.angle||0) + Math.PI*2; // will smoothly animate in tick\n    node.status({fill:'yellow',shape:'dot',text:'Spinning…'});\n    break;\n  case 'waypoint':\n    const wx=Math.random()*260+20, wy=Math.random()*160+20;\n    global.set('waypointSet',true); global.set('waypointX',wx); global.set('waypointY',wy);\n    global.set('isPatrolling',false); global.set('isDocking',false); global.set('isFollowingPath',false);\n    node.status({fill:'green',shape:'dot',text:`WP→(${wx.toFixed(0)},${wy.toFixed(0)})`});\n    msg.waypointCoords = {x:wx, y:wy};\n    break;\n}\nglobal.set('robot',r);\nmsg.payload={cmd,robot:r,isPatrolling:global.get('isPatrolling'),isDocking:global.get('isDocking')};\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 460,
+    "y": 700,
+    "wires": [
+      [
+        "t3-debug-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-cmt-5",
+    "type": "comment",
+    "z": "tab-3",
+    "name": "─── Path Planning ───",
+    "info": "Send a waypoints array [{x,y},…] as the payload to start multi-point path following.",
+    "x": 185,
+    "y": 835,
+    "wires": []
+  },
+  {
+    "id": "t3-inject-path",
+    "type": "inject",
+    "z": "tab-3",
+    "name": "🗺️ Path Plan (demo route)",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "path",
+    "payload": "[{\"x\":80,\"y\":50},{\"x\":220,\"y\":50},{\"x\":250,\"y\":150},{\"x\":150,\"y\":170}]",
+    "payloadType": "json",
+    "x": 185,
+    "y": 880,
+    "wires": [
+      [
+        "t3-fn-path"
+      ]
+    ]
+  },
+  {
+    "id": "t3-fn-path",
+    "type": "function",
+    "z": "tab-3",
+    "name": "Execute Path Plan",
+    "func": "let wps = msg.payload;\nif(!Array.isArray(wps)||!wps.length){ node.warn('No valid waypoints'); return null; }\nconst ZONES=[{id:'A',x1:0,y1:0,x2:160,y2:100},{id:'B',x1:160,y1:0,x2:300,y2:100},{id:'C',x1:0,y1:100,x2:100,y2:200},{id:'D',x1:100,y1:100,x2:300,y2:200}];\nfunction gz(x,y){for(const z of ZONES)if(x\u003E=z.x1&&x\u003Cz.x2&&y\u003E=z.y1&&y\u003Cz.y2)return z.id;return'A';}\n\nglobal.set('activePath',wps); global.set('activePathIndex',0); global.set('isFollowingPath',true);\nglobal.set('isDocking',false); global.set('isPatrolling',false);\nlet r=global.get('robot')||{}; r.docked=false; r.state='running'; global.set('robot',r);\n\nconst route=wps.map((w,i)=\u003E`WP${i+1}:(${w.x},${w.y}) Zone ${gz(w.x,w.y)}`).join(' → ');\nnode.status({fill:'blue',shape:'dot',text:`Path: ${wps.length} WPs`});\nmsg.payload={status:'path_started',waypoints:wps,route,count:wps.length};\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 450,
+    "y": 880,
+    "wires": [
+      [
+        "t3-debug-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t3-debug-cmd",
+    "type": "debug",
+    "z": "tab-3",
+    "name": "🚀 Motion Output",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 700,
+    "y": 550,
+    "wires": []
+  },
+  {
+    "id": "t4-cmt-1",
+    "type": "comment",
+    "z": "tab-4",
+    "name": "Flow Engine — Equivalent of the drag-drop visual flow builder",
+    "info": "Four independent demo chains, each mapping to a section of the original Flow Engine.\n\nChain A: Vibration Sensor → Condition → Reduce Speed + Alert\nChain B: Move To → Pick Payload → Path Planning → Drop Payload\nChain C: Dock → Loop (2×) → Wait 3s\nChain D: Zone Detector → Emergency Stop → Auto-Reset",
+    "x": 380,
+    "y": 40,
+    "wires": []
+  },
+  {
+    "id": "t4-cmt-a",
+    "type": "comment",
+    "z": "tab-4",
+    "name": "Chain A — Vibration Sensor → Condition (IF vib \u003E 40) → Reduce Speed + Alert",
+    "info": "",
+    "x": 360,
+    "y": 100,
+    "wires": []
+  },
+  {
+    "id": "t4-inject-a",
+    "type": "inject",
+    "z": "tab-4",
+    "name": "▶ Run Chain A",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "flow",
+    "payload": "",
+    "payloadType": "date",
+    "x": 160,
+    "y": 150,
+    "wires": [
+      [
+        "t4-fn-vib-sensor"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-vib-sensor",
+    "type": "function",
+    "z": "tab-4",
+    "name": "📡 Vibration Sensor",
+    "func": "const s = global.get('sensors') || {vib:22};\nmsg.payload = {sensorType:'vibration', value:s.vib, threshold:40};\nmsg.topic = 'sensor_read';\nnode.status({fill:'green',shape:'dot',text:`vib=${s.vib.toFixed(1)}%`});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 360,
+    "y": 150,
+    "wires": [
+      [
+        "t4-sw-condition"
+      ]
+    ]
+  },
+  {
+    "id": "t4-sw-condition",
+    "type": "switch",
+    "z": "tab-4",
+    "name": "⚖️ Condition: vib \u003E threshold",
+    "property": "payload.value",
+    "propertyType": "msg",
+    "rules": [
+      {
+        "t": "gt",
+        "v": "payload.threshold",
+        "vt": "msg"
+      },
+      {
+        "t": "else"
+      }
+    ],
+    "checkall": "true",
+    "repair": false,
+    "outputs": 2,
+    "x": 600,
+    "y": 150,
+    "wires": [
+      [
+        "t4-fn-reduce-speed",
+        "t4-fn-send-alert"
+      ],
+      [
+        "t4-fn-no-action"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-reduce-speed",
+    "type": "function",
+    "z": "tab-4",
+    "name": "🐢 Reduce Speed",
+    "func": "let r=global.get('robot')||{};\nconst was=r.speed;\nr.speed=Math.max(20,r.speed-30);\nglobal.set('robot',r);\nmsg.payload={action:'reduce_speed',from:was,to:r.speed,reason:`vib ${msg.payload.value.toFixed(1)}% \u003E ${msg.payload.threshold}%`};\nnode.status({fill:'yellow',shape:'dot',text:`Speed: ${was}% → ${r.speed}%`});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 840,
+    "y": 120,
+    "wires": [
+      [
+        "t4-debug-a"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-send-alert",
+    "type": "function",
+    "z": "tab-4",
+    "name": "🚨 Send Alert",
+    "func": "msg.payload={action:'send_alert',severity:'warning',message:`High vibration: ${msg.payload.value.toFixed(1)}% exceeds threshold ${msg.payload.threshold}%`,timestamp:new Date().toISOString()};\nnode.status({fill:'red',shape:'ring',text:'Alert sent'});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 840,
+    "y": 165,
+    "wires": [
+      [
+        "t4-debug-a"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-no-action",
+    "type": "function",
+    "z": "tab-4",
+    "name": "✅ No Action (normal)",
+    "func": "msg.payload={action:'no_action',status:'nominal',value:msg.payload.value};\nnode.status({fill:'green',shape:'dot',text:'All clear'});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 840,
+    "y": 210,
+    "wires": [
+      [
+        "t4-debug-a"
+      ]
+    ]
+  },
+  {
+    "id": "t4-debug-a",
+    "type": "debug",
+    "z": "tab-4",
+    "name": "Chain A Output",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 1070,
+    "y": 165,
+    "wires": []
+  },
+  {
+    "id": "t4-cmt-b",
+    "type": "comment",
+    "z": "tab-4",
+    "name": "Chain B — Move To → Pick Payload → Path Planning → Drop Payload",
+    "info": "",
+    "x": 340,
+    "y": 290,
+    "wires": []
+  },
+  {
+    "id": "t4-inject-b",
+    "type": "inject",
+    "z": "tab-4",
+    "name": "▶ Run Chain B",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "flow",
+    "payload": "",
+    "payloadType": "date",
+    "x": 160,
+    "y": 340,
+    "wires": [
+      [
+        "t4-fn-move-to"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-move-to",
+    "type": "function",
+    "z": "tab-4",
+    "name": "🚀 Move To (220,50)",
+    "func": "let r=global.get('robot')||{};\nconst target={x:220,y:50,speed:80};\nglobal.set('isDocking',false); global.set('isPatrolling',false); global.set('isFollowingPath',false);\nglobal.set('waypointSet',true); global.set('waypointX',target.x); global.set('waypointY',target.y);\nr.state='running'; r.docked=false; global.set('robot',r);\nmsg.payload={action:'move_to',target,status:'navigating'};\nnode.status({fill:'blue',shape:'dot',text:`→ (${target.x},${target.y})`});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 360,
+    "y": 340,
+    "wires": [
+      [
+        "t4-delay-travel"
+      ]
+    ]
+  },
+  {
+    "id": "t4-delay-travel",
+    "type": "delay",
+    "z": "tab-4",
+    "name": "Travel Time (2s)",
+    "pauseType": "delay",
+    "timeout": "2",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "x": 560,
+    "y": 340,
+    "wires": [
+      [
+        "t4-fn-pick"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-pick",
+    "type": "function",
+    "z": "tab-4",
+    "name": "📦 Pick Payload",
+    "func": "let r=global.get('robot')||{};\nr.payload=true; global.set('robot',r);\nglobal.set('waypointSet',false);\nmsg.payload={action:'pick_payload',type:'Pallet',status:'picked',carrying:true};\nnode.status({fill:'green',shape:'dot',text:'Payload picked ✓'});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 740,
+    "y": 340,
+    "wires": [
+      [
+        "t4-delay-pickup"
+      ]
+    ]
+  },
+  {
+    "id": "t4-delay-pickup",
+    "type": "delay",
+    "z": "tab-4",
+    "name": "Pickup Time (2s)",
+    "pauseType": "delay",
+    "timeout": "2",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "x": 910,
+    "y": 340,
+    "wires": [
+      [
+        "t4-fn-path-plan"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-path-plan",
+    "type": "function",
+    "z": "tab-4",
+    "name": "🗺️ Path Planning",
+    "func": "const wps=[{x:220,y:50},{x:250,y:150},{x:150,y:170}];\nconst ZONES=[{id:'A',x1:0,y1:0,x2:160,y2:100},{id:'B',x1:160,y1:0,x2:300,y2:100},{id:'C',x1:0,y1:100,x2:100,y2:200},{id:'D',x1:100,y1:100,x2:300,y2:200}];\nfunction gz(x,y){for(const z of ZONES)if(x\u003E=z.x1&&x\u003Cz.x2&&y\u003E=z.y1&&y\u003Cz.y2)return z.id;return'A';}\nglobal.set('activePath',wps); global.set('activePathIndex',0); global.set('isFollowingPath',true);\nconst route=wps.map((w,i)=\u003E`WP${i+1}:Zone ${gz(w.x,w.y)}`).join('→');\nmsg.payload={action:'path_planning',waypoints:wps,route,status:'following'};\nnode.status({fill:'blue',shape:'dot',text:`Path: ${wps.length} WPs`});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 1090,
+    "y": 340,
+    "wires": [
+      [
+        "t4-delay-path"
+      ]
+    ]
+  },
+  {
+    "id": "t4-delay-path",
+    "type": "delay",
+    "z": "tab-4",
+    "name": "Path Travel (4s)",
+    "pauseType": "delay",
+    "timeout": "4",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "x": 1260,
+    "y": 340,
+    "wires": [
+      [
+        "t4-fn-drop"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-drop",
+    "type": "function",
+    "z": "tab-4",
+    "name": "📤 Drop Payload",
+    "func": "let r=global.get('robot')||{};\nconst zone=global.get('currentZone')||'D';\nr.payload=false; global.set('robot',r);\nglobal.set('isFollowingPath',false); global.set('activePath',[]); global.set('activePathIndex',0);\nmsg.payload={action:'drop_payload',dropZone:zone,status:'dropped',carrying:false};\nnode.status({fill:'green',shape:'dot',text:`Dropped at Zone ${zone}`});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 1430,
+    "y": 340,
+    "wires": [
+      [
+        "t4-debug-b"
+      ]
+    ]
+  },
+  {
+    "id": "t4-debug-b",
+    "type": "debug",
+    "z": "tab-4",
+    "name": "Chain B Output",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 1610,
+    "y": 340,
+    "wires": []
+  },
+  {
+    "id": "t4-cmt-c",
+    "type": "comment",
+    "z": "tab-4",
+    "name": "Chain C — Dock → Loop (2 iterations × Wait 3s)",
+    "info": "",
+    "x": 300,
+    "y": 480,
+    "wires": []
+  },
+  {
+    "id": "t4-inject-c",
+    "type": "inject",
+    "z": "tab-4",
+    "name": "▶ Run Chain C",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "flow",
+    "payload": "{\"loopTarget\":2}",
+    "payloadType": "json",
+    "x": 160,
+    "y": 530,
+    "wires": [
+      [
+        "t4-fn-dock-cmd"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-dock-cmd",
+    "type": "function",
+    "z": "tab-4",
+    "name": "🔌 Dock Command",
+    "func": "let r=global.get('robot')||{};\nif(r.docked){msg.payload={action:'dock',status:'already_docked'}; return msg;}\nglobal.set('isDocking',true); global.set('isPatrolling',false);\nr.state='running'; global.set('robot',r);\nmsg.payload={action:'dock',status:'docking',loopTarget:msg.payload.loopTarget||2,loopCount:0};\nnode.status({fill:'blue',shape:'dot',text:'Docking…'});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 360,
+    "y": 530,
+    "wires": [
+      [
+        "t4-delay-dock"
+      ]
+    ]
+  },
+  {
+    "id": "t4-delay-dock",
+    "type": "delay",
+    "z": "tab-4",
+    "name": "Dock Travel (3s)",
+    "pauseType": "delay",
+    "timeout": "3",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "x": 540,
+    "y": 530,
+    "wires": [
+      [
+        "t4-fn-loop"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-loop",
+    "type": "function",
+    "z": "tab-4",
+    "name": "🔁 Loop Controller",
+    "func": "let lc = (msg.payload.loopCount||0)+1;\nconst lt = msg.payload.loopTarget||2;\nmsg.payload.loopCount = lc;\nnode.status({fill:'yellow',shape:'dot',text:`Iter ${lc}/${lt}`});\nif(lc \u003C= lt){\n  msg.topic = 'loop_iteration';\n  return [msg, null];\n} else {\n  msg.topic = 'loop_done';\n  return [null, msg];\n}",
+    "outputs": 2,
+    "noerr": 0,
+    "x": 720,
+    "y": 530,
+    "wires": [
+      [
+        "t4-delay-wait"
+      ],
+      [
+        "t4-debug-c"
+      ]
+    ]
+  },
+  {
+    "id": "t4-delay-wait",
+    "type": "delay",
+    "z": "tab-4",
+    "name": "⏸ Wait 3s",
+    "pauseType": "delay",
+    "timeout": "3",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "x": 890,
+    "y": 510,
+    "wires": [
+      [
+        "t4-fn-loop"
+      ]
+    ]
+  },
+  {
+    "id": "t4-debug-c",
+    "type": "debug",
+    "z": "tab-4",
+    "name": "Chain C Output (loop done)",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 930,
+    "y": 555,
+    "wires": []
+  },
+  {
+    "id": "t4-cmt-d",
+    "type": "comment",
+    "z": "tab-4",
+    "name": "Chain D — Zone Detector (Zone D) → Emergency Stop → Auto-Reset 5s",
+    "info": "",
+    "x": 350,
+    "y": 640,
+    "wires": []
+  },
+  {
+    "id": "t4-inject-d",
+    "type": "inject",
+    "z": "tab-4",
+    "name": "▶ Run Chain D",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "topic": "flow",
+    "payload": "",
+    "payloadType": "date",
+    "x": 160,
+    "y": 690,
+    "wires": [
+      [
+        "t4-fn-zone-detector"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-zone-detector",
+    "type": "function",
+    "z": "tab-4",
+    "name": "⬤ Zone Detector (watching D)",
+    "func": "const zone=global.get('currentZone')||'A';\nconst watchZone='D';\nmsg.payload={action:'zone_check',currentZone:zone,watchZone,matched:zone===watchZone};\nnode.status({fill:'blue',shape:'dot',text:`Zone: ${zone} | Watching: ${watchZone}`});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 390,
+    "y": 690,
+    "wires": [
+      [
+        "t4-sw-zone"
+      ]
+    ]
+  },
+  {
+    "id": "t4-sw-zone",
+    "type": "switch",
+    "z": "tab-4",
+    "name": "Zone D?",
+    "property": "payload.matched",
+    "propertyType": "msg",
+    "rules": [
+      {
+        "t": "true"
+      },
+      {
+        "t": "false"
+      }
+    ],
+    "checkall": "true",
+    "repair": false,
+    "outputs": 2,
+    "x": 630,
+    "y": 690,
+    "wires": [
+      [
+        "t4-fn-estop"
+      ],
+      [
+        "t4-fn-zone-safe"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-estop",
+    "type": "function",
+    "z": "tab-4",
+    "name": "🛑 Emergency Stop",
+    "func": "let r=global.get('robot')||{};\nr.speed=0; r.state='error';\nglobal.set('robot',r); global.set('isPatrolling',false); global.set('isDocking',false); global.set('isFollowingPath',false);\nmsg.payload={action:'emergency_stop',reason:`Entered danger Zone ${msg.payload.currentZone}`,resetAfter:5,timestamp:new Date().toISOString()};\nnode.status({fill:'red',shape:'ring',text:'EMERGENCY STOP ⚡'});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 820,
+    "y": 665,
+    "wires": [
+      [
+        "t4-delay-reset"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-zone-safe",
+    "type": "function",
+    "z": "tab-4",
+    "name": "✅ Zone OK",
+    "func": "msg.payload={action:'zone_safe',zone:msg.payload.currentZone,status:'ok'};\nnode.status({fill:'green',shape:'dot',text:'Safe zone'});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 820,
+    "y": 720,
+    "wires": [
+      [
+        "t4-debug-d"
+      ]
+    ]
+  },
+  {
+    "id": "t4-delay-reset",
+    "type": "delay",
+    "z": "tab-4",
+    "name": "Auto-Reset (5s)",
+    "pauseType": "delay",
+    "timeout": "5",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "x": 1030,
+    "y": 665,
+    "wires": [
+      [
+        "t4-fn-auto-resume"
+      ]
+    ]
+  },
+  {
+    "id": "t4-fn-auto-resume",
+    "type": "function",
+    "z": "tab-4",
+    "name": "▶ Auto Resume",
+    "func": "let r=global.get('robot')||{};\nr.state='running'; r.speed=60; global.set('robot',r);\nmsg.payload={action:'auto_resume',speed:60,status:'resumed',timestamp:new Date().toISOString()};\nnode.status({fill:'green',shape:'dot',text:'Resumed at 60%'});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 1220,
+    "y": 665,
+    "wires": [
+      [
+        "t4-debug-d"
+      ]
+    ]
+  },
+  {
+    "id": "t4-debug-d",
+    "type": "debug",
+    "z": "tab-4",
+    "name": "Chain D Output",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 1430,
+    "y": 685,
+    "wires": []
+  },
+  {
+    "id": "t5-cmt-1",
+    "type": "comment",
+    "z": "tab-5",
+    "name": "Alerts & Logging — routes incoming alerts by severity, outputs to debug console and event log",
+    "info": "Receives alerts from Tab 1 via link-in.\nRoutes by level: danger → error debug, warn → warning debug, info/ok → info debug.\nAll events pass through the event log formatter.",
+    "x": 380,
+    "y": 40,
+    "wires": []
+  },
+  {
+    "id": "t5-link-in",
+    "type": "link in",
+    "z": "tab-5",
+    "name": "← Sensor Data",
+    "links": [
+      "t1-link-out-sensor"
+    ],
+    "x": 115,
+    "y": 120,
+    "wires": [
+      [
+        "t5-fn-format-status"
+      ]
+    ]
+  },
+  {
+    "id": "t5-fn-format-status",
+    "type": "function",
+    "z": "tab-5",
+    "name": "Format Status Line",
+    "func": "const d=msg.payload;\nif(!d||!d.sensors) return null;\nconst risk=d.riskScore||0;\nconst status = risk\u003E70?'🔴 CRITICAL':risk\u003E40?'🟡 ELEVATED':'🟢 NOMINAL';\nconst line=`[${new Date().toLocaleTimeString()}] ${status} | Zone:${d.currentZone} | Vib:${d.sensors.vib.toFixed(1)}% | Temp:${d.sensors.temp.toFixed(1)}°C | Batt:${d.robot.battery.toFixed(0)}% | Spd:${d.robot.speed}% | Risk:${risk.toFixed(0)}%`;\nmsg.payload=line; msg.topic='status_line';\nnode.status({fill:risk\u003E70?'red':risk\u003E40?'yellow':'green',shape:'dot',text:status});\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 330,
+    "y": 120,
+    "wires": [
+      [
+        "t5-debug-status"
+      ]
+    ]
+  },
+  {
+    "id": "t5-debug-status",
+    "type": "debug",
+    "z": "tab-5",
+    "name": "📊 Status Line",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 560,
+    "y": 120,
+    "wires": []
+  },
+  {
+    "id": "t5-link-in-alerts",
+    "type": "link in",
+    "z": "tab-5",
+    "name": "← Alerts",
+    "links": [
+      "t1-link-out-alerts"
+    ],
+    "x": 115,
+    "y": 240,
+    "wires": [
+      [
+        "t5-fn-split-alerts"
+      ]
+    ]
+  },
+  {
+    "id": "t5-fn-split-alerts",
+    "type": "function",
+    "z": "tab-5",
+    "name": "Enrich & Split Alerts",
+    "func": "const alerts=msg.payload||[];\nif(!alerts.length){\n  msg.payload={level:'ok',message:'✅ All systems normal',timestamp:new Date().toISOString()};\n  return [null,null,null,msg];\n}\nconst danger=alerts.filter(a=\u003Ea.level==='danger');\nconst warns =alerts.filter(a=\u003Ea.level==='warn');\nconst infos =alerts.filter(a=\u003Ea.level==='info');\nconst oks   =alerts.filter(a=\u003Ea.level==='ok');\nconst ts=new Date().toISOString();\nconst mk=(arr,label)=\u003Earr.length?{payload:{alerts:arr,count:arr.length,label,timestamp:ts},topic:'alert'}:null;\nreturn [mk(danger,'DANGER'),mk(warns,'WARNING'),mk([...infos,...oks],'INFO/OK'),null];",
+    "outputs": 4,
+    "noerr": 0,
+    "x": 330,
+    "y": 240,
+    "wires": [
+      [
+        "t5-debug-danger"
+      ],
+      [
+        "t5-debug-warn"
+      ],
+      [
+        "t5-debug-info"
+      ],
+      [
+        "t5-debug-ok"
+      ]
+    ]
+  },
+  {
+    "id": "t5-debug-danger",
+    "type": "debug",
+    "z": "tab-5",
+    "name": "🔴 DANGER Alerts",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 590,
+    "y": 195,
+    "wires": []
+  },
+  {
+    "id": "t5-debug-warn",
+    "type": "debug",
+    "z": "tab-5",
+    "name": "🟡 WARNING Alerts",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 590,
+    "y": 240,
+    "wires": []
+  },
+  {
+    "id": "t5-debug-info",
+    "type": "debug",
+    "z": "tab-5",
+    "name": "🔵 INFO / OK",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 580,
+    "y": 285,
+    "wires": []
+  },
+  {
+    "id": "t5-debug-ok",
+    "type": "debug",
+    "z": "tab-5",
+    "name": "🟢 All Clear",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 575,
+    "y": 330,
+    "wires": []
+  },
+  {
+    "id": "t5-cmt-2",
+    "type": "comment",
+    "z": "tab-5",
+    "name": "Event Log — structured log of all motion and alert events",
+    "info": "",
+    "x": 220,
+    "y": 420,
+    "wires": []
+  },
+  {
+    "id": "t5-fn-event-log",
+    "type": "function",
+    "z": "tab-5",
+    "name": "Format Event Log Entry",
+    "func": "const ts=new Date().toLocaleTimeString();\nlet entry;\nif(Array.isArray(msg.payload)){\n  entry=msg.payload.map(a=\u003E`[${ts}] [${a.level?.toUpperCase()||'INFO'}] ${a.message||a.detail||JSON.stringify(a)}`).join('\\n');\n} else if(typeof msg.payload==='object'){\n  const p=msg.payload;\n  const lvl=(p.level||p.severity||'INFO').toUpperCase();\n  entry=`[${ts}] [${lvl}] ${p.message||p.action||p.event||JSON.stringify(p)}`;\n} else {\n  entry=`[${ts}] [INFO] ${msg.payload}`;\n}\nmsg.payload=entry; msg.topic='event_log';\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 340,
+    "y": 470,
+    "wires": [
+      [
+        "t5-debug-log"
+      ]
+    ]
+  },
+  {
+    "id": "t5-debug-log",
+    "type": "debug",
+    "z": "tab-5",
+    "name": "📋 Event Log",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 570,
+    "y": 470,
+    "wires": []
+  }
 ]
