@@ -1,0 +1,17 @@
+{
+  "name": "neuroflow-hmi",
+  "version": "1.0.0",
+  "description": "NeuroFlow HMI - Node-RED based operator dashboard with digital twin, automation templates, and AI agent",
+  "node-red": {
+    "nodes": {
+      "neuroflow-hmi": "flows.json"
+    }
+  },
+  "dependencies": {
+    "node-red-dashboard": "^3.6.0",
+    "node-red-contrib-mqtt-broker": "optional"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
