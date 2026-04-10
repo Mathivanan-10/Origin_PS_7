@@ -1,0 +1,17 @@
+version: '3.7'
+services:
+  nodered:
+    image: nodered/node-red:latest
+    container_name: neuroflow-hmi
+    ports:
+      - "1880:1880"
+    volumes:
+      - ./flows.json:/data/flows.json
+      - ./settings.js:/data/settings.js
+      - node-red-data:/data
+    environment:
+      - TZ=UTC
+    restart: unless-stopped
+
+volumes:
+  node-red-data:
